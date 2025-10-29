@@ -2,6 +2,7 @@ import ctypes
 import multiprocessing
 import queue
 import sys
+import threading
 from datetime import datetime
 
 try:
@@ -10,6 +11,18 @@ except ImportError as exc:  # pragma: no cover - informative import guard
     raise ImportError("PyQt5 is required to run the GUI version of the bot.") from exc
 
 import bot_logic
+
+
+def speak_async(text):
+    """Run text-to-speech in background thread to avoid blocking GUI"""
+    def _speak():
+        try:
+            bot_logic.engine.say(text)
+            bot_logic.engine.runAndWait()
+        except Exception:
+            pass  # Silently fail if TTS fails
+    thread = threading.Thread(target=_speak, daemon=True)
+    thread.start()
 
 STYLE_SHEET = """
 QWidget {
@@ -21,8 +34,8 @@ QWidget {
 QGroupBox {
     border: 1px solid #1f8b4c;
     border-radius: 8px;
-    margin-top: 16px;
-    padding: 16px;
+    margin-top: 12px;
+    padding: 10px;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
@@ -32,6 +45,10 @@ QGroupBox::title {
     font-weight: bold;
     font-size: 10pt;
 }
+QGroupBox#statusGroup QLabel {
+    font-weight: bold;
+    font-size: 13pt;
+}
 QLabel#titleLabel {
     color: #46ff9a;
     font-size: 20pt;
@@ -40,29 +57,14 @@ QLabel#titleLabel {
 QFrame#separatorLine {
     border: 1px solid #113c3d;
 }
-QLabel#badgeLabel {
-    padding: 2px 12px;
-    border: 1px solid #1f8b4c;
-    border-radius: 10px;
-    font-weight: bold;
-    color: #1f8b4c;
-    background-color: rgba(31, 139, 76, 40);
-}
-QLabel#badgeLabel[mode="running"] {
-    border-color: #1ed760;
-    color: #1ed760;
-    background-color: rgba(30, 215, 96, 40);
-}
-QLabel#badgeLabel[mode="idle"] {
-    border-color: #ff5f6d;
-    color: #ff5f6d;
-    background-color: rgba(255, 95, 109, 40);
-}
 QLabel#statusValueLabel,
 QLabel#lootValueLabel,
-QLabel#legendaryValueLabel {
-    font-size: 16pt;
+QLabel#legendaryValueLabel,
+QLabel#runningTimeLabel {
+    font-size: 18pt;
     font-weight: bold;
+}
+QLabel#statusValueLabel {
     color: #46ff9a;
 }
 QLabel#statusValueLabel[running="true"] {
@@ -70,6 +72,18 @@ QLabel#statusValueLabel[running="true"] {
 }
 QLabel#statusValueLabel[running="false"] {
     color: #ff5f6d;
+}
+QLabel#lootLabel {
+    color: #FFD700;
+}
+QLabel#lootValueLabel {
+    color: #FFD700;
+}
+QLabel#legendaryLabel {
+    color: #FF6B6B;
+}
+QLabel#legendaryValueLabel {
+    color: #FF6B6B;
 }
 QPushButton {
     background-color: #0f1f2e;
@@ -84,6 +98,12 @@ QPushButton:hover {
 }
 QPushButton:pressed {
     background-color: #091220;
+}
+QPushButton#startButton,
+QPushButton#stopButton {
+    padding: 16px 24px;
+    min-height: 40px;
+    font-size: 11pt;
 }
 QPushButton#startButton {
     border-color: #1ed760;
@@ -195,6 +215,7 @@ class BotWindow(QtWidgets.QMainWindow):
         self.wait_after_enemy_spawn = shared_state["wait_after_enemy_spawn"]
         self.loot_opened = shared_state["loot_opened"]
         self.legendaries = shared_state["legendaries"]
+        self.screenshot_enabled = shared_state["screenshot_enabled"]
 
         self.status_queue = multiprocessing.Queue()
         self.process = None
@@ -212,15 +233,15 @@ class BotWindow(QtWidgets.QMainWindow):
 
     def _init_window(self):
         self.setWindowTitle("TLOPO Bot Controller")
-        self.setMinimumSize(600, 520)
+        self.setMinimumSize(600, 650)
 
     def _build_ui(self):
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
 
         main_layout = QtWidgets.QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
 
         header_layout = QtWidgets.QHBoxLayout()
         header_layout.setSpacing(12)
@@ -229,14 +250,6 @@ class BotWindow(QtWidgets.QMainWindow):
         self.title_label.setObjectName("titleLabel")
         self.title_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         header_layout.addWidget(self.title_label)
-
-        header_layout.addItem(QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum))
-
-        self.badge_label = QtWidgets.QLabel("IDLE")
-        self.badge_label.setObjectName("badgeLabel")
-        self.badge_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.badge_label.setProperty("mode", "idle")
-        header_layout.addWidget(self.badge_label, alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
         main_layout.addLayout(header_layout)
 
@@ -253,14 +266,15 @@ class BotWindow(QtWidgets.QMainWindow):
 
         dashboard_page = QtWidgets.QWidget()
         dashboard_layout = QtWidgets.QVBoxLayout(dashboard_page)
-        dashboard_layout.setContentsMargins(10, 10, 10, 10)
-        dashboard_layout.setSpacing(10)
+        dashboard_layout.setContentsMargins(6, 6, 6, 6)
+        dashboard_layout.setSpacing(8)
 
         self.status_group = QtWidgets.QGroupBox("Current Status")
+        self.status_group.setObjectName("statusGroup")
         status_layout = QtWidgets.QGridLayout()
         status_layout.setColumnStretch(1, 1)
-        status_layout.setHorizontalSpacing(12)
-        status_layout.setVerticalSpacing(10)
+        status_layout.setHorizontalSpacing(100)
+        status_layout.setVerticalSpacing(8)
 
         status_layout.addWidget(QtWidgets.QLabel("Bot Status"), 0, 0)
         self.status_value_label = QtWidgets.QLabel("Stopped")
@@ -268,12 +282,16 @@ class BotWindow(QtWidgets.QMainWindow):
         self.status_value_label.setProperty("running", "false")
         status_layout.addWidget(self.status_value_label, 0, 1)
 
-        status_layout.addWidget(QtWidgets.QLabel("Loot Opened"), 1, 0)
+        loot_label = QtWidgets.QLabel("Loot Opened")
+        loot_label.setObjectName("lootLabel")
+        status_layout.addWidget(loot_label, 1, 0)
         self.loot_value_label = QtWidgets.QLabel("0")
         self.loot_value_label.setObjectName("lootValueLabel")
         status_layout.addWidget(self.loot_value_label, 1, 1)
 
-        status_layout.addWidget(QtWidgets.QLabel("Legendaries Found"), 2, 0)
+        legendary_label = QtWidgets.QLabel("Legendaries Found")
+        legendary_label.setObjectName("legendaryLabel")
+        status_layout.addWidget(legendary_label, 2, 0)
         self.legendary_value_label = QtWidgets.QLabel("0")
         self.legendary_value_label.setObjectName("legendaryValueLabel")
         status_layout.addWidget(self.legendary_value_label, 2, 1)
@@ -288,7 +306,7 @@ class BotWindow(QtWidgets.QMainWindow):
 
         control_container = QtWidgets.QGroupBox("Quick Controls")
         controls_layout = QtWidgets.QHBoxLayout()
-        controls_layout.setSpacing(12)
+        controls_layout.setSpacing(8)
         self.start_button = QtWidgets.QPushButton("Start")
         self.start_button.setObjectName("startButton")
         self.stop_button = QtWidgets.QPushButton("Stop")
@@ -298,23 +316,21 @@ class BotWindow(QtWidgets.QMainWindow):
         control_container.setLayout(controls_layout)
         dashboard_layout.addWidget(control_container)
 
-        dashboard_layout.addStretch(1)
-
         self.tab_widget.addTab(dashboard_page, "Overview")
 
         advanced_page = QtWidgets.QWidget()
         advanced_layout = QtWidgets.QVBoxLayout(advanced_page)
-        advanced_layout.setContentsMargins(10, 10, 10, 10)
-        advanced_layout.setSpacing(10)
+        advanced_layout.setContentsMargins(6, 6, 6, 6)
+        advanced_layout.setSpacing(8)
 
         timing_group = QtWidgets.QGroupBox("Timing Settings")
         timing_layout = QtWidgets.QGridLayout()
         timing_layout.setHorizontalSpacing(12)
-        timing_layout.setVerticalSpacing(10)
+        timing_layout.setVerticalSpacing(8)
 
         timing_layout.addWidget(QtWidgets.QLabel("Wait after enemy spawn (sec)"), 0, 0)
         self.wait_spin = QtWidgets.QDoubleSpinBox()
-        self.wait_spin.setDecimals(2)
+        self.wait_spin.setDecimals(3)
         self.wait_spin.setRange(0.0, 30.0)
         self.wait_spin.setSingleStep(0.25)
         self.wait_spin.setValue(float(self.wait_after_enemy_spawn.value))
@@ -322,7 +338,7 @@ class BotWindow(QtWidgets.QMainWindow):
 
         timing_layout.addWidget(QtWidgets.QLabel("Time between attacks (sec)"), 1, 0)
         self.attack_spin = QtWidgets.QDoubleSpinBox()
-        self.attack_spin.setDecimals(2)
+        self.attack_spin.setDecimals(3)
         self.attack_spin.setRange(0.0, 10.0)
         self.attack_spin.setSingleStep(0.1)
         self.attack_spin.setValue(float(self.attack_delay.value))
@@ -333,7 +349,7 @@ class BotWindow(QtWidgets.QMainWindow):
 
         actions_group = QtWidgets.QGroupBox("Reset Options")
         actions_layout = QtWidgets.QHBoxLayout()
-        actions_layout.setSpacing(12)
+        actions_layout.setSpacing(8)
         self.reset_timings_button = QtWidgets.QPushButton("Reset Timers")
         self.reset_timings_button.setObjectName("resetTimingButton")
         self.reset_stats_button = QtWidgets.QPushButton("Reset Stats")
@@ -343,6 +359,22 @@ class BotWindow(QtWidgets.QMainWindow):
         actions_group.setLayout(actions_layout)
         advanced_layout.addWidget(actions_group)
 
+        screenshot_group = QtWidgets.QGroupBox("Screenshot Options")
+        screenshot_layout = QtWidgets.QVBoxLayout()
+        screenshot_layout.setSpacing(8)
+
+        self.screenshot_checkbox = QtWidgets.QCheckBox("Enable Screenshots")
+        self.screenshot_checkbox.setChecked(bool(self.screenshot_enabled.value))
+        screenshot_layout.addWidget(self.screenshot_checkbox)
+
+        self.open_folder_button = QtWidgets.QPushButton("Open Screenshot Folder")
+        self.open_folder_button.setObjectName("openFolderButton")
+        self.open_folder_button.setEnabled(bool(self.screenshot_enabled.value))
+        screenshot_layout.addWidget(self.open_folder_button)
+
+        screenshot_group.setLayout(screenshot_layout)
+        advanced_layout.addWidget(screenshot_group)
+
         log_group = QtWidgets.QGroupBox("Event Log")
         log_layout = QtWidgets.QVBoxLayout()
         self.log_view = QtWidgets.QPlainTextEdit()
@@ -350,13 +382,11 @@ class BotWindow(QtWidgets.QMainWindow):
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(1000)
         self.log_view.setPlaceholderText("Event trace will appear here...")
-        self.log_view.setMinimumHeight(180)
-        self.log_view.setMaximumHeight(220)
+        self.log_view.setMinimumHeight(120)
+        self.log_view.setMaximumHeight(150)
         log_layout.addWidget(self.log_view)
         log_group.setLayout(log_layout)
-        advanced_layout.addWidget(log_group, stretch=1)
-
-        advanced_layout.addStretch(1)
+        advanced_layout.addWidget(log_group)
 
         self.tab_widget.addTab(advanced_page, "Advanced Settings")
 
@@ -370,6 +400,9 @@ class BotWindow(QtWidgets.QMainWindow):
 
         self.wait_spin.valueChanged.connect(self._handle_wait_changed)
         self.attack_spin.valueChanged.connect(self._handle_attack_changed)
+
+        self.screenshot_checkbox.stateChanged.connect(self._handle_screenshot_toggled)
+        self.open_folder_button.clicked.connect(self._handle_open_folder)
 
     def _start_status_timer(self):
         self.status_timer = QtCore.QTimer(self)
@@ -390,7 +423,6 @@ class BotWindow(QtWidgets.QMainWindow):
         palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#0b1724"))
         self.setPalette(palette)
         self.setStyleSheet(STYLE_SHEET)
-        self._refresh_badge_style()
 
     def _finalize_size(self):
         self.adjustSize()
@@ -419,6 +451,7 @@ class BotWindow(QtWidgets.QMainWindow):
                     self.loot_opened,
                     self.legendaries,
                     self.status_queue,
+                    self.screenshot_enabled,
                 ),
             )
             self.process.daemon = True
@@ -427,8 +460,7 @@ class BotWindow(QtWidgets.QMainWindow):
                 self.started_flag.value = True
             self._bot_start_time = datetime.now()
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000002)
-            bot_logic.engine.say("Bot Started")
-            bot_logic.engine.runAndWait()
+            speak_async("Bot Started")
             self._append_log("Bot process started.")
         except Exception as exc:  # pragma: no cover - runtime safeguard
             self._append_log(f"Failed to start bot: {exc}")
@@ -473,7 +505,7 @@ class BotWindow(QtWidgets.QMainWindow):
         with self.wait_after_enemy_spawn.get_lock():
             self.wait_after_enemy_spawn.value = float(value)
         if self.wait_spin.hasFocus():
-            self._append_log(f"Updated wait after spawn to {value:.2f}s.")
+            self._append_log(f"Updated wait after spawn to {value:.3f}s.")
 
     def _handle_attack_changed(self, value):
         if self._syncing_controls:
@@ -481,7 +513,61 @@ class BotWindow(QtWidgets.QMainWindow):
         with self.attack_delay.get_lock():
             self.attack_delay.value = float(value)
         if self.attack_spin.hasFocus():
-            self._append_log(f"Updated attack delay to {value:.2f}s.")
+            self._append_log(f"Updated attack delay to {value:.3f}s.")
+
+    def _handle_screenshot_toggled(self, state):
+        """Handle screenshot checkbox toggle"""
+        is_enabled = (state == QtCore.Qt.Checked)
+        with self.screenshot_enabled.get_lock():
+            self.screenshot_enabled.value = is_enabled
+
+        # Enable/disable the open folder button based on checkbox state
+        self.open_folder_button.setEnabled(is_enabled)
+
+        status_text = "enabled" if is_enabled else "disabled"
+        self._append_log(f"Screenshots {status_text}.")
+
+    def _handle_open_folder(self):
+        """Open the screenshot folder in Windows Explorer"""
+        import os
+        import subprocess
+
+        # Base screenshot folder
+        base_folder = bot_logic.get_data_path('Data\\All Loot Screenshots')
+
+        # Try to find the latest session folder
+        folder_to_open = base_folder
+        try:
+            if os.path.exists(base_folder):
+                # List all session folders
+                session_folders = [
+                    f for f in os.listdir(base_folder)
+                    if os.path.isdir(os.path.join(base_folder, f)) and f.startswith('Session_')
+                ]
+                if session_folders:
+                    # Sort by name (timestamp in folder name ensures chronological order)
+                    session_folders.sort(reverse=True)
+                    latest_session = session_folders[0]
+                    folder_to_open = os.path.join(base_folder, latest_session)
+                    self._append_log(f"Opening latest session: {latest_session}")
+        except Exception as e:
+            self._append_log(f"Error finding latest session: {e}")
+
+        # Create folder if it doesn't exist
+        if not os.path.exists(folder_to_open):
+            try:
+                os.makedirs(folder_to_open)
+                self._append_log(f"Created screenshot folder: {folder_to_open}")
+            except Exception as e:
+                self._append_log(f"Error creating folder: {e}")
+                return
+
+        # Open folder in Explorer
+        try:
+            subprocess.Popen(f'explorer "{folder_to_open}"')
+            self._append_log("Opened screenshot folder.")
+        except Exception as e:
+            self._append_log(f"Error opening folder: {e}")
 
     def _poll_status(self):
         current_started = bool(self.started_flag.value)
@@ -530,14 +616,6 @@ class BotWindow(QtWidgets.QMainWindow):
         self.loot_value_label.setText(str(int(self.loot_opened.value)))
         self.legendary_value_label.setText(str(int(self.legendaries.value)))
 
-        if running:
-            self.badge_label.setText("ONLINE")
-            self.badge_label.setProperty("mode", "running")
-        else:
-            self.badge_label.setText("IDLE")
-            self.badge_label.setProperty("mode", "idle")
-        self._refresh_badge_style()
-
         # Update running time display
         total_seconds = self._accumulated_time
         if running and self._bot_start_time is not None:
@@ -549,12 +627,6 @@ class BotWindow(QtWidgets.QMainWindow):
         minutes = int((total_seconds % 3600) // 60)
         seconds = int(total_seconds % 60)
         self.running_time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-
-
-    def _refresh_badge_style(self):
-        self.badge_label.style().unpolish(self.badge_label)
-        self.badge_label.style().polish(self.badge_label)
-        self.badge_label.update()
 
     def _refresh_status_style(self):
         self.status_value_label.style().unpolish(self.status_value_label)
@@ -644,13 +716,17 @@ class BotWindow(QtWidgets.QMainWindow):
         if self.process:
             self.process.terminate()
             self.process.join(timeout=2.0)
+            # Force kill if process didn't terminate gracefully
+            if self.process.is_alive():
+                self._append_log("Process didn't stop gracefully, force killing...")
+                self.process.kill()
+                self.process.join(timeout=1.0)
             self.process = None
 
         with self.started_flag.get_lock():
             self.started_flag.value = False
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
-        bot_logic.engine.say("Bot Stopped")
-        bot_logic.engine.runAndWait()
+        speak_async("Bot Stopped")
         note = "Bot stopped." if manual else "Bot process ended."
         self._append_log(note)
         self._drain_status_queue()
@@ -682,6 +758,7 @@ def _build_shared_state():
         "wait_after_enemy_spawn": multiprocessing.Value("d", 5.5),
         "loot_opened": multiprocessing.Value("i", 0),
         "legendaries": multiprocessing.Value("i", 0),
+        "screenshot_enabled": multiprocessing.Value("i", True),  # Default: enabled
     }
 
 

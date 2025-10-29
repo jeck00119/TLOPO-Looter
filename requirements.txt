@@ -1,6 +1,18 @@
-numpy
-opencv-python
+# TLOPO Looter - Requirements
+# Core dependencies for the bot application
+
+# GUI Framework
 PyQt5
-pyttsx3
-colorama
+
+# Computer Vision & Image Processing
+opencv-python
+numpy
+
+# Windows API (for screen capture, window manipulation, input simulation)
 pywin32
+
+# Text-to-Speech
+pyttsx3
+
+# Build Tool (for creating .exe)
+pyinstaller

@@ -5,6 +5,16 @@ import win32ui
 
 
 class WindowCapture:
+    # Crop region definitions (x, y, width, height)
+    CROP_REGIONS = {
+        "crop_boss_name": {"x": 570, "y": 70, "w": 200, "h": 25},
+        "crop_enemy_hp": {"x": 571, "y": 93, "w": 225, "h": 18},
+        "crop_hit_combo": {"x": 200, "y": 195, "w": 200, "h": 50},
+        "crop_loot_window": {"x": 207, "y": 209, "w": 397, "h": 262},
+        "crop_open_loot": {"x": 570, "y": 684, "w": 155, "h": 34},
+        "crop_test": {"x": 925, "y": 68, "w": 148, "h": 26},
+    }
+
     # properties
     w = 0
     h = 0
@@ -13,6 +23,15 @@ class WindowCapture:
     cropped_y = 0
     offset_x = 0
     offset_y = 0
+
+    def __enter__(self):
+        """Context manager entry - allows 'with' statement usage"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup resources if needed"""
+        # Resources are cleaned up in get_screenshot, but this ensures proper context manager support
+        return False  # Don't suppress exceptions
 
     def get_screenshot(self, window_name=None, crop=None):
 
@@ -28,95 +47,58 @@ class WindowCapture:
         # get the window size
         window_rect = win32gui.GetWindowRect(self.hwnd)
 
-        if crop == "crop_boss_name":
-            # x, y, w, h: (571, 93, 225, 18)
-
-            self.w = 200
-            self.h = 25
-
-            self.cropped_x = 570
-            self.cropped_y = 70
-
-        elif crop == "crop_enemy_hp":
-            # x, y, w, h: (571, 93, 225, 18)
-
-            self.w = 225
-            self.h = 18
-
-            self.cropped_x = 571
-            self.cropped_y = 93
-
-        elif crop == "crop_hit_combo":
-            self.w = 200
-            self.h = 50
-
-            self.cropped_x = 200
-            self.cropped_y = 195
-
-        elif crop == "crop_loot_window":
-            # x, y, w, h: (207, 209, 397, 262)
-
-            self.w = 397
-            self.h = 262
-
-            self.cropped_x = 207
-            self.cropped_y = 209
-
-        elif crop == "crop_open_loot":
-            self.w = 155
-            self.h = 34
-
-            self.cropped_x = 570
-            self.cropped_y = 684
-
-        elif crop == 'crop_test':
-            self.w = 148
-            self.h = 26
-
-            self.cropped_x = 925
-            self.cropped_y = 68
-
+        # Use dictionary lookup for crop regions
+        if crop and crop in self.CROP_REGIONS:
+            region = self.CROP_REGIONS[crop]
+            self.w = region["w"]
+            self.h = region["h"]
+            self.cropped_x = region["x"]
+            self.cropped_y = region["y"]
         else:
+            # Full window capture
             self.w = window_rect[2] - window_rect[0]
             self.h = window_rect[3] - window_rect[1]
-
             self.cropped_x = 0
             self.cropped_y = 0
 
         # get the window image data
-        wDC = win32gui.GetWindowDC(self.hwnd)
-        dcObj = win32ui.CreateDCFromHandle(wDC)
-        cDC = dcObj.CreateCompatibleDC()
-        dataBitMap = win32ui.CreateBitmap()
-        dataBitMap.CreateCompatibleBitmap(dcObj, self.w, self.h)
-        cDC.SelectObject(dataBitMap)
-        cDC.BitBlt((0, 0), (self.w, self.h), dcObj, (self.cropped_x, self.cropped_y), win32con.SRCCOPY)
+        wDC = None
+        dcObj = None
+        cDC = None
+        dataBitMap = None
 
-        # convert the raw data into a format opencv can read
-        # dataBitMap.SaveBitmapFile(cDC, 'debug.bmp')
-        signedIntsArray = dataBitMap.GetBitmapBits(True)
-        img = np.fromstring(signedIntsArray, dtype='uint8')
-        img.shape = (self.h, self.w, 4)
+        try:
+            wDC = win32gui.GetWindowDC(self.hwnd)
+            dcObj = win32ui.CreateDCFromHandle(wDC)
+            cDC = dcObj.CreateCompatibleDC()
+            dataBitMap = win32ui.CreateBitmap()
+            dataBitMap.CreateCompatibleBitmap(dcObj, self.w, self.h)
+            cDC.SelectObject(dataBitMap)
+            cDC.BitBlt((0, 0), (self.w, self.h), dcObj, (self.cropped_x, self.cropped_y), win32con.SRCCOPY)
 
-        # free resources
-        dcObj.DeleteDC()
-        cDC.DeleteDC()
-        win32gui.ReleaseDC(self.hwnd, wDC)
-        win32gui.DeleteObject(dataBitMap.GetHandle())
+            # convert the raw data into a format opencv can read
+            signedIntsArray = dataBitMap.GetBitmapBits(True)
+            img = np.frombuffer(signedIntsArray, dtype='uint8')
+            img.shape = (self.h, self.w, 4)
 
-        # drop the alpha channel, or cv.matchTemplate() will throw an error like:
-        #   error: (-215:Assertion failed) (depth == CV_8U || depth == CV_32F) && type == _templ.type() 
-        #   && _img.dims() <= 2 in function 'cv::matchTemplate'
-        img = img[..., :3]
+            # drop the alpha channel, or cv.matchTemplate() will throw an error
+            img = img[..., :3]
 
-        # make image C_CONTIGUOUS to avoid errors that look like:
-        #   File ... in draw_rectangles
-        #   TypeError: an integer is required (got type tuple)
-        # see the discussion here:
-        # https://github.com/opencv/opencv/issues/14866#issuecomment-580207109
-        img = np.ascontiguousarray(img)
+            # make image C_CONTIGUOUS to avoid errors
+            img = np.ascontiguousarray(img)
 
-        return img
+            return img
+
+        finally:
+            # Always free resources, even if an exception occurs
+            if dcObj is not None:
+                dcObj.DeleteDC()
+            if cDC is not None:
+                cDC.DeleteDC()
+            if wDC is not None and self.hwnd is not None:
+                win32gui.ReleaseDC(self.hwnd, wDC)
+            if dataBitMap is not None:
+                win32gui.DeleteObject(dataBitMap.GetHandle())
 
     # find the name of the window you're interested in.
     # once you have it, update window_capture()
