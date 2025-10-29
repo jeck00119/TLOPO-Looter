@@ -76,7 +76,8 @@ class Vision:
         if not hsv_filter:
             raise ValueError("hsv_filter is required for apply_hsv_filter()")
 
-        # add/subtract saturation and value
+        # Pre-process: Adjust saturation and value before thresholding
+        # This expands/contracts the color range to better match legendary items
         h, s, v = cv.split(hsv)
         s = self.shift_channel(s, hsv_filter.sAdd)
         s = self.shift_channel(s, -hsv_filter.sSub)
@@ -95,9 +96,12 @@ class Vision:
     # given an image and a Canny edge filter, apply the filter and return the resulting image.
     # if a filter is not supplied, the control GUI trackbars will be used
 
-    # apply adjustments to an HSV channel
-    # https://stackoverflow.com/questions/49697363/shifting-hsv-pixel-values-in-python-using-numpy
     def shift_channel(self, c, amount):
+        """
+        Shifts HSV channel values while preventing overflow/underflow.
+        Clamps pixels at 0 or 255 boundaries instead of wrapping around.
+        Used to fine-tune legendary item detection by adjusting saturation/value.
+        """
         if amount > 0:
             lim = 255 - amount
             c[c >= lim] = 255

@@ -6,6 +6,8 @@ import win32ui
 
 class WindowCapture:
     # Crop region definitions (x, y, width, height)
+    # IMPORTANT: Coordinates are for 1280x800 game window only
+    # (0,0) = top-left corner of game client area (inside window borders)
     CROP_REGIONS = {
         "crop_boss_name": {"x": 570, "y": 70, "w": 200, "h": 25},
         "crop_enemy_hp": {"x": 571, "y": 93, "w": 225, "h": 18},
@@ -34,7 +36,11 @@ class WindowCapture:
         return False  # Don't suppress exceptions
 
     def get_screenshot(self, window_name=None, crop=None):
-
+        """
+        Captures window screenshot using Win32 API (works even when game is minimized/background).
+        Uses BitBlt to copy pixel data from window DC to bitmap, then converts to OpenCV format.
+        Returns: numpy array (BGR format, no alpha channel)
+        """
         # find the handle for the window we want to capture.
         # if no window name is given, capture the entire screen
         if window_name is None:

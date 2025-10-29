@@ -232,7 +232,7 @@ class BotWindow(QtWidgets.QMainWindow):
         self._finalize_size()
 
     def _init_window(self):
-        self.setWindowTitle("TLOPO Bot Controller")
+        self.setWindowTitle("TLOPO Looter")
         self.setMinimumSize(600, 650)
 
     def _build_ui(self):
@@ -276,27 +276,27 @@ class BotWindow(QtWidgets.QMainWindow):
         status_layout.setHorizontalSpacing(100)
         status_layout.setVerticalSpacing(8)
 
-        status_layout.addWidget(QtWidgets.QLabel("Bot Status"), 0, 0)
+        status_layout.addWidget(QtWidgets.QLabel("⚙️ Bot Status"), 0, 0)
         self.status_value_label = QtWidgets.QLabel("Stopped")
         self.status_value_label.setObjectName("statusValueLabel")
         self.status_value_label.setProperty("running", "false")
         status_layout.addWidget(self.status_value_label, 0, 1)
 
-        loot_label = QtWidgets.QLabel("Loot Opened")
+        loot_label = QtWidgets.QLabel("💰 Loot Opened")
         loot_label.setObjectName("lootLabel")
         status_layout.addWidget(loot_label, 1, 0)
         self.loot_value_label = QtWidgets.QLabel("0")
         self.loot_value_label.setObjectName("lootValueLabel")
         status_layout.addWidget(self.loot_value_label, 1, 1)
 
-        legendary_label = QtWidgets.QLabel("Legendaries Found")
+        legendary_label = QtWidgets.QLabel("💎 Legendaries Found")
         legendary_label.setObjectName("legendaryLabel")
         status_layout.addWidget(legendary_label, 2, 0)
         self.legendary_value_label = QtWidgets.QLabel("0")
         self.legendary_value_label.setObjectName("legendaryValueLabel")
         status_layout.addWidget(self.legendary_value_label, 2, 1)
 
-        status_layout.addWidget(QtWidgets.QLabel("Running Time"), 3, 0)
+        status_layout.addWidget(QtWidgets.QLabel("⏱️ Running Time"), 3, 0)
         self.running_time_label = QtWidgets.QLabel("00:00:00")
         self.running_time_label.setObjectName("runningTimeLabel")
         status_layout.addWidget(self.running_time_label, 3, 1)
@@ -307,9 +307,9 @@ class BotWindow(QtWidgets.QMainWindow):
         control_container = QtWidgets.QGroupBox("Quick Controls")
         controls_layout = QtWidgets.QHBoxLayout()
         controls_layout.setSpacing(8)
-        self.start_button = QtWidgets.QPushButton("Start")
+        self.start_button = QtWidgets.QPushButton("▶️ Start")
         self.start_button.setObjectName("startButton")
-        self.stop_button = QtWidgets.QPushButton("Stop")
+        self.stop_button = QtWidgets.QPushButton("⏹️ Stop")
         self.stop_button.setObjectName("stopButton")
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.stop_button)
@@ -474,7 +474,7 @@ class BotWindow(QtWidgets.QMainWindow):
         self._stop_bot_process(manual=True)
 
     def _handle_reset_timings(self):
-        defaults = {"attack_delay": 0.0, "wait_after_enemy_spawn": 5.5}
+        defaults = {"attack_delay": 0.1, "wait_after_enemy_spawn": 5.5}
         with self.attack_delay.get_lock():
             self.attack_delay.value = defaults["attack_delay"]
         with self.wait_after_enemy_spawn.get_lock():
@@ -754,7 +754,7 @@ def _build_shared_state():
     return {
         "started": multiprocessing.Value("i", False),
         "gui_settings_opened": multiprocessing.Value("i", False),
-        "attack_delay": multiprocessing.Value("d", 0.0),
+        "attack_delay": multiprocessing.Value("d", 0.1),
         "wait_after_enemy_spawn": multiprocessing.Value("d", 5.5),
         "loot_opened": multiprocessing.Value("i", 0),
         "legendaries": multiprocessing.Value("i", 0),

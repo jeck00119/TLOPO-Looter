@@ -5,10 +5,18 @@ An automated bot for "The Legend of Pirates Online [BETA]" that uses computer vi
 ## Features
 
 - **Automated Loot Collection**: Detects loot prompts and automatically collects items
-- **Enemy Detection & Combat**: Identifies enemy health bars and engages in combat
+- **Smart Duplicate Prevention**: Three-layer protection system prevents processing same loot window multiple times
+  - Message overlay detection (waits for clean view)
+  - Hash-based frame comparison (skips identical windows)
+  - Automatic cleanup of old hashes
+- **Enemy Detection & Combat**: Identifies enemy health bars and engages in combat with clean event logging
 - **Legendary Item Tracking**: Detects legendary loot using HSV color filtering and saves screenshots
-- **Modern PyQt5 GUI**: Real-time statistics, event logging, and easy-to-use controls
+  - **Legendary Verification System**: Double-checks if legendary was taken, with automatic fallback if collection fails
+  - Saves fallback screenshots when retry is needed
+- **Modern PyQt5 GUI**: Real-time statistics with emoji indicators, event logging, and easy-to-use controls
+- **Session-Based Organization**: Screenshots organized by timestamp folders for easy tracking
 - **Statistics Tracking**: Tracks loot opened, legendaries found, and total running time
+- **Emoji-Enhanced Logging**: Visual event logs with pirate-themed and functional emojis (🏴‍☠️ 💰 💎 ⚔️ 🗝️)
 - **Configurable Settings**: Adjustable attack delays and spawn wait times
 - **Text-to-Speech Feedback**: Audio notifications for bot events
 - **Portable Executable**: Build as a single .exe file for easy distribution
@@ -109,7 +117,7 @@ TLOPO_Looter.exe
 
 **Timing Settings (Advanced Settings Tab):**
 - **Wait after enemy spawn**: Delay before engaging enemies (default: 5.5s)
-- **Attack delay**: Time between consecutive attacks (default: 0.0s)
+- **Attack delay**: Time between consecutive attacks (default: 0.1s)
 
 Settings are saved and can be adjusted in real-time through the GUI.
 
@@ -129,6 +137,7 @@ TLOPO-Looter/
 ├── vision.py                           # Computer vision & template matching
 ├── windowcapture.py                    # Windows screen capture utility
 ├── hsvfilter.py                        # HSV color filter configuration
+├── test_message_detection.py          # Test script for message overlay detection
 ├── icon.ico                            # Application icon
 ├── requirements.txt                    # Python dependencies
 └── README.md                           # This file
@@ -139,16 +148,29 @@ TLOPO-Looter/
 1. **Window Detection**: Locates the game window and ensures 1280x800 resolution
 2. **Window Validation**: Continuously verifies window state (every 0.3s) to prevent misclicks
 3. **Template Matching**: Uses OpenCV to detect UI elements (loot prompts, health bars)
-4. **HSV Color Filtering**: Identifies legendary items by red/gold color signature
-5. **Input Simulation**: Sends keyboard/mouse events via Windows API
-6. **Screenshot Capture**: Saves all loot screenshots automatically
-7. **Error Handling**: Comprehensive error management for reliability
+4. **Message Overlay Detection**: Analyzes pixel darkness in bottom-left region to detect game messages
+5. **Duplicate Prevention**: MD5 hash comparison prevents processing same window multiple times
+6. **HSV Color Filtering**: Identifies legendary items by red/gold color signature
+7. **Legendary Verification**: Re-scans after collection to ensure legendary was taken, with fallback retry
+8. **Input Simulation**: Sends keyboard/mouse events via Windows API
+9. **Screenshot Capture**: Saves all loot screenshots to session-based folders
+10. **Error Handling**: Comprehensive error management for reliability
 
 ## Data Output
 
-The bot automatically creates a `Data/` directory next to the executable with:
-- `Data/All Loot Screenshots/Regular Loot/` - Regular loot screenshots
-- `Data/All Loot Screenshots/Legendary Loot/` - Legendary loot screenshots with metadata
+The bot automatically creates a `Data/` directory next to the executable with session-based organization:
+
+```
+Data/
+└── All Loot Screenshots/
+    └── Session_DD-MM-YYYY_HH.MM.SS/
+        ├── Regular Loot/          # Regular loot screenshots (1.jpg, 2.jpg, ...)
+        └── Legendary Loot/        # Legendary screenshots + fallback attempts
+            ├── Legendary_X.jpg
+            └── Legendary_X_FALLBACK.jpg  # If verification retry was needed
+```
+
+Each bot session creates a new timestamped folder for organized tracking.
 
 ## Technical Details
 
