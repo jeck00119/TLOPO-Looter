@@ -1,13 +1,17 @@
 import cv2 as cv2
+import ctypes
+from ctypes import wintypes
 import hashlib
 import numpy as np
 import os
+import psutil
 import pyttsx3
 import sys
 import time
 import win32api as api
 import win32con
 import win32gui as gui
+import winreg
 from datetime import datetime
 from time import sleep
 from win32con import WM_KEYDOWN, WM_KEYUP, VK_CONTROL, WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON, VK_SHIFT
@@ -25,6 +29,9 @@ from windowcapture import WindowCapture
 GAME_WINDOW_TITLE = "The Legend of Pirates Online [BETA]"
 GAME_RESOLUTION = (1280, 800)
 WINDOW_BORDER_OFFSET = (16, 39)  # (width, height) borders
+
+# Data Storage Paths
+SCREENSHOT_BASE_PATH = 'Data\\All Loot Screenshots'
 
 # Timing Delays (seconds)
 LOOP_DELAY = 0.3
@@ -105,21 +112,28 @@ def ensure_data_directories(session_folder=None):
     """
     Create data directories. If session_folder is provided, creates session-based structure.
     Otherwise creates legacy flat structure.
+    Returns: (success, error_message) - False if any directory creation failed
     """
     if session_folder:
         # Session-based structure
         targets = [
-            get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot'),
-            get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Regular Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\Legendary Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\Regular Loot'),
         ]
     else:
         # Legacy flat structure (backward compatibility)
         targets = [
-            get_data_path('Data\\All Loot Screenshots\\Legendary Loot'),
-            get_data_path('Data\\All Loot Screenshots\\Regular Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\Legendary Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\Regular Loot'),
         ]
+
+    # Use centralized utility for consistency and error reporting
     for target in targets:
-        os.makedirs(target, exist_ok=True)
+        success, error = ensure_directory_exists(target)
+        if not success:
+            return (False, f"Failed to create directory {target}: {error}")
+
+    return (True, None)
 
 
 def ensure_directory_exists(path):
@@ -151,12 +165,12 @@ def get_screenshot_path(session_folder, filename, legendary=False, fallback=Fals
         filename = f"{base}_FALLBACK{ext}"
 
     subfolder = 'Legendary Loot' if legendary else 'Regular Loot'
-    return get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\{subfolder}\\{filename}')
+    return get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\{subfolder}\\{filename}')
 
 
 def get_info_path(session_folder, filename):
     """Construct path for legendary info text file"""
-    return get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot\\{filename}')
+    return get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\Legendary Loot\\{filename}')
 
 
 def _initial_image_index():
@@ -329,6 +343,164 @@ def check_dpi_settings(hwnd):
         return (True, f"Resolution check skipped: {e}")
 
 
+def check_dpi_registry_setting(hwnd):
+    """
+    Check if game executable has DPI override set in Windows registry.
+    Returns: (status, exe_path, registry_value, message)
+    Status: "correct", "incorrect", "not_set", "error"
+    """
+    try:
+        # Get process ID from window handle
+        process_id = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+
+        # Get executable path using psutil
+        try:
+            process = psutil.Process(process_id.value)
+            exe_path = process.exe()
+        except:
+            return ("error", None, None, "Could not get process executable path")
+
+        # Check registry for DPI override setting
+        try:
+            reg_key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
+                0,
+                winreg.KEY_READ
+            )
+
+            try:
+                value, reg_type = winreg.QueryValueEx(reg_key, exe_path)
+                winreg.CloseKey(reg_key)
+
+                # Check what type of DPI override is set
+                # System = "~ DPIUNAWARE" (with space)
+                # Application = "~ HIGHDPIAWARE"
+                # System (Enhanced) = "~ GDIDPISCALING DPIUNAWARE"
+
+                if "~ DPIUNAWARE" in value and "GDIDPISCALING" not in value:
+                    return ("correct", exe_path, value, "DPI Override set to 'System' (correct)")
+                elif "~ HIGHDPIAWARE" in value:
+                    return ("incorrect", exe_path, value, "DPI Override set to 'Application' (should be 'System')")
+                elif "~ GDIDPISCALING DPIUNAWARE" in value:
+                    return ("incorrect", exe_path, value, "DPI Override set to 'System (Enhanced)' (should be 'System')")
+                else:
+                    return ("incorrect", exe_path, value, f"Unknown DPI Override: {value}")
+
+            except FileNotFoundError:
+                winreg.CloseKey(reg_key)
+                return ("not_set", exe_path, None, "No DPI Override set in registry")
+
+        except FileNotFoundError:
+            return ("not_set", exe_path, None, "Registry key does not exist")
+
+    except Exception as e:
+        return ("error", None, None, f"Error checking registry: {e}")
+
+
+def set_dpi_override_to_system(exe_path):
+    """
+    Automatically set DPI override to 'System' in Windows registry.
+
+    Args:
+        exe_path: Full path to executable
+
+    Returns: (success, message)
+    """
+    try:
+        # Registry key path
+        key_path = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
+        # Try to open existing key or create if it doesn't exist
+        try:
+            reg_key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                key_path,
+                0,
+                winreg.KEY_WRITE
+            )
+        except FileNotFoundError:
+            # Key doesn't exist, create it
+            reg_key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path)
+
+        # Set the DPI override value
+        # "~ DPIUNAWARE" = System (note the space after ~)
+        winreg.SetValueEx(reg_key, exe_path, 0, winreg.REG_SZ, "~ DPIUNAWARE")
+        winreg.CloseKey(reg_key)
+
+        return (True, "Successfully set DPI override to 'System'")
+
+    except PermissionError:
+        return (False, "Permission denied. Try running as administrator.")
+    except Exception as e:
+        return (False, f"Failed to set registry value: {e}")
+
+
+def handle_dpi_configuration(hwnd):
+    """
+    Handle DPI configuration workflow: check status and apply fix if needed.
+
+    This function centralizes the DPI configuration logic that was previously
+    split between bot_logic.py and main_gui.py.
+
+    Args:
+        hwnd: Window handle
+
+    Returns: dict with keys:
+        - success: bool - Whether DPI is correctly configured (after fix if applied)
+        - action: str - "already_correct", "fixed", "failed", "error"
+        - exe_path: str - Executable path
+        - message: str - User-friendly message
+        - restart_required: bool - Whether game needs restart
+    """
+    result = {
+        'success': False,
+        'action': 'error',
+        'exe_path': None,
+        'message': '',
+        'restart_required': False
+    }
+
+    try:
+        # Check current DPI status
+        status, exe_path, reg_value, status_message = check_dpi_registry_setting(hwnd)
+        result['exe_path'] = exe_path
+
+        if status == "error":
+            result['message'] = status_message
+            return result
+
+        if status == "correct":
+            result['success'] = True
+            result['action'] = 'already_correct'
+            result['message'] = "DPI override already correctly configured"
+            return result
+
+        # DPI needs fixing (status is "not_set" or "incorrect")
+        if not exe_path:
+            result['message'] = "Could not determine executable path"
+            return result
+
+        # Attempt to apply fix
+        fix_success, fix_message = set_dpi_override_to_system(exe_path)
+
+        if fix_success:
+            result['success'] = True
+            result['action'] = 'fixed'
+            result['message'] = fix_message
+            result['restart_required'] = True
+        else:
+            result['action'] = 'failed'
+            result['message'] = fix_message
+
+        return result
+
+    except Exception as e:
+        result['message'] = f"Error handling DPI configuration: {e}"
+        return result
+
+
 # ===========================
 # END WINDOW UTILITIES
 # ===========================
@@ -421,6 +593,29 @@ def validate_game_ready():
     except Exception as e:
         return (False, f"Cannot write to Data/ folder. Check permissions. Error: {e}", details)
 
+    # Check 6: DPI override configured correctly
+    dpi_status, exe_path, dpi_value, dpi_message = check_dpi_registry_setting(handle)
+    details['dpi_status'] = dpi_status
+    details['dpi_exe_path'] = exe_path
+    details['dpi_registry_value'] = dpi_value
+
+    if dpi_status == "error":
+        # Error checking DPI - don't block, but warn
+        details['dpi_warning'] = dpi_message
+    elif dpi_status in ["not_set", "incorrect"]:
+        # DPI override missing or wrong - offer to fix automatically
+        error_msg = f"DPI Override Configuration Issue\n\n"
+        error_msg += f"Game: {exe_path}\n"
+        error_msg += f"Status: {dpi_message}\n\n"
+        error_msg += f"The bot can automatically fix this for you.\n\n"
+        error_msg += f"Would you like to apply the fix?\n"
+        error_msg += f"(After fixing, you MUST restart the game for changes to take effect)"
+
+        # Return special status for GUI to handle with Yes/No dialog
+        return (False, error_msg, details)
+
+    details['dpi_ok'] = True
+
     # All checks passed
     return (True, "All validation checks passed", details)
 
@@ -481,7 +676,7 @@ def has_message_overlay(frame):
         return False
 
 
-def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, loot_opened, legendaries, status_queue=None, screenshot_enabled=None):
+def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, loot_opened, legendaries, status_queue=None, screenshot_enabled=None, session_folder=None):
     """Main bot loop extracted from the CLI script."""
 
     def notify(event_type, message=None, **payload):
@@ -514,7 +709,11 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
         """
         try:
             if save_screenshots:
-                ensure_data_directories(session_folder)
+                success, error = ensure_data_directories(session_folder)
+                if not success:
+                    notify("error", f"❌ {error}")
+                    # Continue without screenshots instead of crashing
+                    save_screenshots = False
 
             mask = vision_loot.apply_hsv_filter(frame, hsv_filter)
             kernel = np.ones(DILATION_KERNEL_SIZE, "uint8")
@@ -649,9 +848,11 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
     # Initialize screenshot counter (always starts at 1 for each session)
     current_img = _initial_image_index()
 
-    # Create session folder name with timestamp
-    start_time = datetime.now()
-    session_folder = start_time.strftime("Session_%d-%m-%Y_%H.%M.%S")
+    # Use provided session folder or create new one (backward compatibility)
+    if session_folder is None:
+        # Fallback: create new session if not provided
+        start_time = datetime.now()
+        session_folder = start_time.strftime("Session_%d-%m-%Y_%H.%M.%S")
     notify("status", f"🏴‍☠️ Bot loop started. Session: {session_folder}")
 
     handle = check_window()

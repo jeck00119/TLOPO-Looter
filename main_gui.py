@@ -239,6 +239,10 @@ class BotWindow(QtWidgets.QMainWindow):
         self._last_started_state = bool(self.started_flag.value)
         self._force_close = False  # Flag to force exit without tray
 
+        # Create session folder once per application run (not per Start/Stop)
+        # Session persists until app is fully closed and reopened
+        self._session_folder = datetime.now().strftime("Session_%d-%m-%Y_%H.%M.%S")
+
         self._init_window()
         self._build_ui()
         self._connect_signals()
@@ -246,6 +250,10 @@ class BotWindow(QtWidgets.QMainWindow):
         self._apply_theme()
         self._finalize_size()
         self._setup_tray_icon()
+
+        # Log session creation
+        self._append_log(f"📁 Session folder created: {self._session_folder}")
+        self._append_log("ℹ️ Session persists until app is closed (not affected by Start/Stop)")
 
     def _init_window(self):
         self.setWindowTitle("TLOPO Looter")
@@ -680,51 +688,135 @@ class BotWindow(QtWidgets.QMainWindow):
         Returns: (success, error_message)
         """
         try:
-            # Run validation in subprocess to avoid PyQt5 event loop interference
-            # PyQt5's event loop causes window resize to fail
-            import subprocess
-            import sys
+            # Check if running as frozen exe (PyInstaller)
+            if getattr(sys, 'frozen', False):
+                # Running as compiled exe - run validation directly (no subprocess)
+                # Frozen exe doesn't support -c flag, would cause GUI to open again
+                success, msg, details = bot_logic.validate_game_ready()
 
-            # Run validation script directly
-            result = subprocess.run(
-                [sys.executable, "-c",
-                 "import bot_logic; success, msg, details = bot_logic.validate_game_ready(); print('SUCCESS' if success else f'FAIL:{msg}')"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            # Get last line only (ignore any debug output)
-            lines = result.stdout.strip().split('\n')
-            last_line = lines[-1] if lines else ''
-
-            if last_line == 'SUCCESS':
-                return (True, "Validation passed")
-            elif last_line.startswith('FAIL:'):
-                return (False, last_line[5:])  # Remove 'FAIL:' prefix
+                if success:
+                    return (True, "Validation passed")
+                else:
+                    return (False, msg)
             else:
-                return (False, f"Validation error: {last_line if last_line else 'No output'}")
+                # Running as Python script - use subprocess to avoid PyQt5 event loop interference
+                # PyQt5's event loop causes window resize to fail
+                import subprocess
 
-        except subprocess.TimeoutExpired:
-            return (False, "Validation timeout")
+                # Run validation script directly
+                # Use special prefix for DPI issues so GUI can handle them differently
+                result = subprocess.run(
+                    [sys.executable, "-c",
+                     "import bot_logic; success, msg, details = bot_logic.validate_game_ready(); "
+                     "prefix = 'DPI_ERROR:' if not success and 'DPI Override Configuration Issue' in msg else 'FAIL:'; "
+                     "print('SUCCESS' if success else f'{prefix}{msg}')"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                # Get output (handle multiline messages)
+                output = result.stdout.strip()
+
+                if output == 'SUCCESS':
+                    return (True, "Validation passed")
+                elif output.startswith('DPI_ERROR:'):
+                    # DPI error - return with special marker (may be multiline)
+                    return (False, output[10:])  # Remove 'DPI_ERROR:' prefix
+                elif output.startswith('FAIL:'):
+                    # Get last line only for regular errors (ignore debug output)
+                    lines = output.split('\n')
+                    last_line = lines[-1] if lines else ''
+                    return (False, last_line[5:] if last_line.startswith('FAIL:') else output[5:])
+                else:
+                    return (False, f"Validation error: {output if output else 'No output'}")
+
         except Exception as e:
             return (False, f"Validation error: {e}")
 
     def _show_validation_error(self, error_message):
-        """Show error dialog and switch to Help tab"""
-        msg_box = QMessageBox(self)
-        msg_box.setIcon(QMessageBox.Critical)
-        msg_box.setWindowTitle("Startup Validation Failed")
-        msg_box.setText(error_message)
-        msg_box.setInformativeText("Please check the Help tab for setup instructions.")
-        msg_box.setStandardButtons(QMessageBox.Ok)
-        msg_box.exec_()
+        """Show error dialog and switch to Help tab. Handles DPI fix automatically."""
 
-        # Switch to Help tab (index 2: Overview=0, Advanced=1, Help=2)
-        self.tab_widget.setCurrentIndex(2)
+        # Check if this is a DPI configuration issue that can be auto-fixed
+        if "DPI Override Configuration Issue" in error_message:
+            # Show Yes/No dialog for auto-fix
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.setWindowTitle("DPI Configuration Required")
+            msg_box.setText(error_message)
+            msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg_box.setDefaultButton(QMessageBox.Yes)
 
-        # Log the validation failure
-        self._append_log(f"Startup blocked: {error_message}")
+            response = msg_box.exec_()
+
+            if response == QMessageBox.Yes:
+                # User wants to apply fix - use centralized workflow
+                self._append_log("Applying DPI override fix...")
+
+                try:
+                    handle = bot_logic.check_window()
+                    if handle:
+                        # Use centralized DPI configuration handler
+                        result = bot_logic.handle_dpi_configuration(handle)
+
+                        if result['action'] == 'fixed':
+                            # Success - show restart instruction
+                            success_box = QMessageBox(self)
+                            success_box.setIcon(QMessageBox.Information)
+                            success_box.setWindowTitle("DPI Override Applied")
+                            success_box.setText("✅ DPI override has been set to 'System'")
+                            success_box.setInformativeText(
+                                "IMPORTANT: You must RESTART the game for changes to take effect.\n\n"
+                                "Steps:\n"
+                                "1. Close the game completely\n"
+                                "2. Restart the game\n"
+                                "3. Click Start in the bot again"
+                            )
+                            success_box.setStandardButtons(QMessageBox.Ok)
+                            success_box.exec_()
+
+                            self._append_log(f"✅ {result['message']}")
+                            self._append_log("⚠️ Please restart the game for changes to take effect.")
+                        elif result['action'] == 'already_correct':
+                            # Already configured correctly
+                            self._append_log(f"✅ {result['message']}")
+                        else:
+                            # Failed to apply fix
+                            fail_box = QMessageBox(self)
+                            fail_box.setIcon(QMessageBox.Critical)
+                            fail_box.setWindowTitle("Failed to Apply Fix")
+                            fail_box.setText(f"❌ {result['message']}")
+                            fail_box.setInformativeText("Please apply the fix manually. Check the Help tab for instructions.")
+                            fail_box.setStandardButtons(QMessageBox.Ok)
+                            fail_box.exec_()
+
+                            self._append_log(f"❌ {result['message']}")
+                            self.tab_widget.setCurrentIndex(2)  # Switch to Help tab
+                    else:
+                        self._append_log("❌ Could not find game window")
+                        self.tab_widget.setCurrentIndex(2)
+                except Exception as e:
+                    self._append_log(f"❌ Error applying DPI fix: {e}")
+                    self.tab_widget.setCurrentIndex(2)
+            else:
+                # User declined fix - show manual instructions
+                self._append_log("DPI fix declined. Please configure manually.")
+                self.tab_widget.setCurrentIndex(2)  # Switch to Help tab
+        else:
+            # Regular validation error - show normal error dialog
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Critical)
+            msg_box.setWindowTitle("Startup Validation Failed")
+            msg_box.setText(error_message)
+            msg_box.setInformativeText("Please check the Help tab for setup instructions.")
+            msg_box.setStandardButtons(QMessageBox.Ok)
+            msg_box.exec_()
+
+            # Switch to Help tab (index 2: Overview=0, Advanced=1, Help=2)
+            self.tab_widget.setCurrentIndex(2)
+
+            # Log the validation failure
+            self._append_log(f"Startup blocked: {error_message}")
 
     def _handle_start_clicked(self):
         if self._bot_is_running():
@@ -751,6 +843,7 @@ class BotWindow(QtWidgets.QMainWindow):
                     self.legendaries,
                     self.status_queue,
                     self.screenshot_enabled,
+                    self._session_folder,  # Pass persistent session folder
                 ),
             )
             self.process.daemon = True
@@ -832,7 +925,7 @@ class BotWindow(QtWidgets.QMainWindow):
         import subprocess
 
         # Base screenshot folder
-        base_folder = bot_logic.get_data_path('Data\\All Loot Screenshots')
+        base_folder = bot_logic.get_data_path(bot_logic.SCREENSHOT_BASE_PATH)
 
         # Try to find the latest session folder
         folder_to_open = base_folder
@@ -904,6 +997,21 @@ class BotWindow(QtWidgets.QMainWindow):
         self._update_status_labels()
         self._last_started_state = current_started
 
+    def _format_elapsed_time(self, total_seconds):
+        """
+        Format elapsed time in seconds to HH:MM:SS string.
+
+        Args:
+            total_seconds: Time in seconds (float or int)
+
+        Returns:
+            Formatted time string (e.g., "01:23:45")
+        """
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = int(total_seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
     def _update_status_labels(self, initial=False):
         running = bool(self.started_flag.value)
         self.status_value_label.setText("Running" if running else "Stopped")
@@ -922,10 +1030,7 @@ class BotWindow(QtWidgets.QMainWindow):
             current_elapsed = (datetime.now() - self._bot_start_time).total_seconds()
             total_seconds += current_elapsed
 
-        hours = int(total_seconds // 3600)
-        minutes = int((total_seconds % 3600) // 60)
-        seconds = int(total_seconds % 60)
-        self.running_time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        self.running_time_label.setText(self._format_elapsed_time(total_seconds))
 
     def _refresh_status_style(self):
         self.status_value_label.style().unpolish(self.status_value_label)
@@ -1127,10 +1232,29 @@ def _build_shared_state():
     }
 
 
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
+def main():
+    """Main entry point - only runs in the main process"""
     shared_state = _build_shared_state()
     app = QtWidgets.QApplication(sys.argv)
     window = BotWindow(shared_state)
     window.show()
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    # Required for PyInstaller to work with multiprocessing on Windows
+    # freeze_support() must be called FIRST before any other code
+    multiprocessing.freeze_support()
+
+    # CRITICAL: Only run GUI in main process, not in spawned subprocesses
+    # This prevents the frozen exe from opening multiple windows
+    if multiprocessing.current_process().name == 'MainProcess':
+        # Set spawn method explicitly for Windows + PyInstaller compatibility
+        if sys.platform == 'win32':
+            try:
+                multiprocessing.set_start_method('spawn')
+            except RuntimeError:
+                # Already set, ignore
+                pass
+
+        main()
