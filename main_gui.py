@@ -7,6 +7,8 @@ from datetime import datetime
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
+    from PyQt5.QtGui import QMovie, QIcon
+    from PyQt5.QtWidgets import QSystemTrayIcon, QMenu, QMessageBox
 except ImportError as exc:  # pragma: no cover - informative import guard
     raise ImportError("PyQt5 is required to run the GUI version of the bot.") from exc
 
@@ -202,6 +204,18 @@ QScrollBar::add-line:vertical,
 QScrollBar::sub-line:vertical {
     height: 0;
 }
+QTextBrowser {
+    background-color: #010b10;
+    border: 1px solid rgba(30, 215, 96, 0.4);
+    border-radius: 10px;
+    padding: 15px;
+    color: #d1f7ff;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 10pt;
+}
+QTextBrowser:focus {
+    border-color: rgba(70, 255, 154, 0.6);
+}
 """
 
 class BotWindow(QtWidgets.QMainWindow):
@@ -223,6 +237,7 @@ class BotWindow(QtWidgets.QMainWindow):
         self._accumulated_time = 0  # Total seconds accumulated across sessions
         self._syncing_controls = False
         self._last_started_state = bool(self.started_flag.value)
+        self._force_close = False  # Flag to force exit without tray
 
         self._init_window()
         self._build_ui()
@@ -230,6 +245,7 @@ class BotWindow(QtWidgets.QMainWindow):
         self._start_status_timer()
         self._apply_theme()
         self._finalize_size()
+        self._setup_tray_icon()
 
     def _init_window(self):
         self.setWindowTitle("TLOPO Looter")
@@ -240,16 +256,53 @@ class BotWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central_widget)
 
         main_layout = QtWidgets.QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setContentsMargins(8, 0, 8, 8)  # left, top, right, bottom - no top margin
         main_layout.setSpacing(8)
 
         header_layout = QtWidgets.QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)  # No margins around header
         header_layout.setSpacing(12)
+
+        # Add animated GIF (left)
+        self.gif_label = QtWidgets.QLabel()
+        self.gif_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.gif_label.setScaledContents(True)
+        self.gif_label.setMaximumSize(160, 120)  # Max size limit
+        self.gif_label.setMinimumSize(80, 60)   # Min size limit
+        gif_path = bot_logic.resource_path("img/pirates_skull.gif")
+        self.movie = QMovie(gif_path)
+        if self.movie.isValid():
+            # Scale the GIF wider but not taller
+            self.movie.setScaledSize(QtCore.QSize(128, 96))
+            self.gif_label.setMovie(self.movie)
+            self.movie.start()
+            header_layout.addWidget(self.gif_label)
+
+        # Add stretch to push title to center
+        header_layout.addStretch()
 
         self.title_label = QtWidgets.QLabel("TLOPO Looter")
         self.title_label.setObjectName("titleLabel")
-        self.title_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.title_label.setAlignment(QtCore.Qt.AlignCenter | QtCore.Qt.AlignVCenter)
         header_layout.addWidget(self.title_label)
+
+        # Add stretch to center the title
+        header_layout.addStretch()
+
+        # Add second pirate skull GIF on the right side
+        self.chest_gif_label = QtWidgets.QLabel()
+        self.chest_gif_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.chest_gif_label.setScaledContents(True)
+        self.chest_gif_label.setMaximumSize(160, 120)  # Max size limit
+        self.chest_gif_label.setMinimumSize(80, 60)   # Min size limit
+        chest_gif_path = bot_logic.resource_path("img/pirates_skull.gif")
+        self.chest_movie = QMovie(chest_gif_path)
+        if self.chest_movie.isValid():
+            # Scale the GIF to match left skull size
+            self.chest_movie.setScaledSize(QtCore.QSize(128, 96))
+            self.chest_gif_label.setMovie(self.chest_movie)
+            self.chest_movie.start()
+            header_layout.addWidget(self.chest_gif_label)
 
         main_layout.addLayout(header_layout)
 
@@ -390,6 +443,125 @@ class BotWindow(QtWidgets.QMainWindow):
 
         self.tab_widget.addTab(advanced_page, "Advanced Settings")
 
+        # Help Tab
+        help_page = QtWidgets.QWidget()
+        help_layout = QtWidgets.QVBoxLayout(help_page)
+        help_layout.setContentsMargins(6, 6, 6, 6)
+        help_layout.setSpacing(8)
+
+        # Help text view
+        help_text = QtWidgets.QTextBrowser()
+        help_text.setOpenExternalLinks(False)
+        help_text.setReadOnly(True)
+        help_text.setHtml("""
+        <style>
+            body { font-family: 'Consolas', monospace; color: #d1f7ff; background-color: #010b10; }
+            h2 { color: #46ff9a; border-bottom: 2px solid #1f8b4c; padding-bottom: 5px; }
+            h3 { color: #66d9ff; margin-top: 15px; }
+            ul { margin-left: 20px; }
+            li { margin-bottom: 8px; line-height: 1.5; }
+            .warning { color: #ff5f6d; font-weight: bold; }
+            .important { color: #FFD700; font-weight: bold; }
+            .tip { color: #1ed760; }
+        </style>
+
+        <h2>📚 TLOPO Looter - User Manual</h2>
+        <br>
+
+        <h3>⚙️ First Time Setup</h3>
+        <p><span class="warning"><b>IMPORTANT:</b></span></p>
+        <ol>
+            <li>Configure game DPI settings:
+                <ul>
+                    <li>Right-click the game shortcut → Properties</li>
+                    <li>Compatibility tab → "Change high DPI settings"</li>
+                    <li>Check "Override high DPI scaling"</li>
+                    <li>Select <b>"System"</b> from the dropdown</li>
+                    <li>Click OK and restart the game</li>
+                </ul>
+            </li>
+            <li>Make sure the game window is <b>1280x800 resolution</b> (bot auto-adjusts)</li>
+        </ol>
+
+        <h3>🚀 How to Use</h3>
+        <ol>
+            <li><b>Start the game</b> - Open "The Legend of Pirates Online [BETA]"</li>
+            <li><b>Position your character very close to the ENEMIES</b></li>
+            <li><b>Click the "Start" button</b> in the Overview tab</li>
+            <li><b>Let it run!</b> - The bot will <b>fully automatically</b>:
+                <ul>
+                    <li>Detect and attack enemies using the Ctrl key</li>
+                    <li>Open chests that drop from defeated enemies</li>
+                    <li>Collect small items</li>
+                    <li>Collect legendary items</li>
+                    <li>Trash regular loot</li>
+                </ul>
+            </li>
+            <li><b>Click "Stop"</b> when you're done farming</li>
+        </ol>
+
+        <h3>📊 Statistics Explained</h3>
+        <ul>
+            <li><b>💰 Loot Opened:</b> Total chests/loot windows processed</li>
+            <li><b>💎 Legendaries Found:</b> Number of legendary items detected</li>
+            <li><b>⏱️ Running Time:</b> How long the bot has been active</li>
+        </ul>
+
+        <h3>📸 Screenshots</h3>
+        <ul>
+            <li>Enable/disable in the <b>Advanced Settings</b> tab</li>
+            <li>Screenshots are saved in the <b>Data/All Loot Screenshots/</b> folder</li>
+            <li>Each session gets its own timestamped folder</li>
+            <li>Click "Open Screenshot Folder" to view</li>
+        </ul>
+
+        <h3>⚙️ Timing Settings</h3>
+        <ul>
+            <li><b>Wait after enemy spawn:</b> Delay before attacking (default 5.5s)</li>
+            <li><b>Time between attacks:</b> Attack speed (default 0.1s)</li>
+            <li>Adjust if the bot attacks too fast/slow</li>
+        </ul>
+
+        <h3>❓ Troubleshooting</h3>
+        <ul>
+            <li><span class="warning">Bot not clicking correctly?</span>
+                <ul>
+                    <li>Check DPI settings (see Setup above)</li>
+                    <li>Make sure the game is exactly 1280x800</li>
+                    <li>Restart the game after changing settings</li>
+                </ul>
+            </li>
+            <li><span class="warning">Game window not detected?</span>
+                <ul>
+                    <li>Make sure the game window title is exact</li>
+                    <li>Don't minimize the game window</li>
+                </ul>
+            </li>
+            <li><span class="warning">Bot not collecting loot?</span>
+                <ul>
+                    <li>Make sure enemies are nearby and spawning</li>
+                    <li>The bot automatically opens chests from defeated enemies</li>
+                    <li>Check the Event Log for detection messages</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h3>💡 Tips & Important Notes</h3>
+        <ul>
+            <li>Let the bot run while you do other things</li>
+            <li>Check the Event Log in the Advanced Settings tab for details</li>
+            <li>The Reset Stats button clears counters and timer</li>
+            <li>Screenshots help track legendary drops</li>
+        </ul>
+
+        <p style="text-align: center; margin-top: 20px; color: #46ff9a; font-size: 11pt;">
+            <b>🏴‍☠️ Happy Looting, Pirate! 🏴‍☠️</b>
+        </p>
+        """)
+
+        help_layout.addWidget(help_text)
+        self.tab_widget.addTab(help_page, "❓ Help")
+
         self._update_status_labels(initial=True)
 
     def _connect_signals(self):
@@ -432,6 +604,74 @@ class BotWindow(QtWidgets.QMainWindow):
             height = size_hint.height()
             self.setMinimumSize(width, height)
             self.resize(width, height)
+
+    def _setup_tray_icon(self):
+        """Setup system tray icon with menu"""
+        # Check if system tray is available
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        # Create tray icon
+        self.tray_icon = QSystemTrayIcon(self)
+
+        # Try to load icon, fallback to default if not found
+        icon_path = bot_logic.resource_path("icon.ico")
+        try:
+            icon = QIcon(icon_path)
+            if not icon.isNull():
+                self.tray_icon.setIcon(icon)
+                self.setWindowIcon(icon)  # Also set window icon
+            else:
+                # Fallback to default icon
+                self.tray_icon.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon))
+        except:
+            self.tray_icon.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon))
+
+        # Create tray menu
+        tray_menu = QMenu()
+
+        show_action = tray_menu.addAction("Show Window")
+        show_action.triggered.connect(self._restore_from_tray)
+
+        tray_menu.addSeparator()
+
+        exit_action = tray_menu.addAction("Exit")
+        exit_action.triggered.connect(self._exit_application)
+
+        self.tray_icon.setContextMenu(tray_menu)
+
+        # Connect double-click to restore
+        self.tray_icon.activated.connect(self._tray_icon_activated)
+
+        # Show tray icon
+        self.tray_icon.show()
+
+    def _tray_icon_activated(self, reason):
+        """Handle tray icon activation (click)"""
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        """Restore window from system tray"""
+        self.show()
+        self.setWindowState(self.windowState() & ~QtCore.Qt.WindowMinimized | QtCore.Qt.WindowActive)
+        self.activateWindow()
+
+    def _minimize_to_tray(self):
+        """Minimize window to system tray"""
+        self.hide()
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.showMessage(
+                "TLOPO Looter",
+                "Application minimized to tray. Double-click to restore.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+
+    def _exit_application(self):
+        """Force exit the application"""
+        self._force_close = True
+        self.close()
 
     def _handle_start_clicked(self):
         if self._bot_is_running():
@@ -738,16 +978,82 @@ class BotWindow(QtWidgets.QMainWindow):
         )
 
     def closeEvent(self, event):
-        self.status_timer.stop()
-        try:
-            self._stop_bot_process(manual=False)
+        """Handle window close event - ask user if they want to minimize to tray or exit"""
+        # If force close flag is set, exit without asking
+        if self._force_close:
+            self.status_timer.stop()
+            # Stop animated GIFs
+            if hasattr(self, 'movie') and self.movie:
+                self.movie.stop()
+            if hasattr(self, 'chest_movie') and self.chest_movie:
+                self.chest_movie.stop()
+            # Hide tray icon
+            if hasattr(self, 'tray_icon'):
+                self.tray_icon.hide()
             try:
-                self.status_queue.close()
-                self.status_queue.join_thread()
-            except Exception:
-                pass
-        finally:
-            event.accept()
+                self._stop_bot_process(manual=False)
+                try:
+                    self.status_queue.close()
+                    self.status_queue.join_thread()
+                except Exception:
+                    pass
+            finally:
+                event.accept()
+            return
+
+        # Ask user if they want to minimize to tray or exit
+        if hasattr(self, 'tray_icon') and QSystemTrayIcon.isSystemTrayAvailable():
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("TLOPO Looter")
+            msg_box.setText("What would you like to do?")
+            msg_box.setIcon(QMessageBox.Question)
+
+            minimize_btn = msg_box.addButton("Minimize to Tray", QMessageBox.ActionRole)
+            exit_btn = msg_box.addButton("Exit Application", QMessageBox.DestructiveRole)
+            cancel_btn = msg_box.addButton("Cancel", QMessageBox.RejectRole)
+
+            msg_box.exec_()
+
+            clicked_button = msg_box.clickedButton()
+
+            if clicked_button == minimize_btn:
+                # Minimize to tray
+                event.ignore()
+                self._minimize_to_tray()
+            elif clicked_button == exit_btn:
+                # Exit application
+                self._force_close = True
+                self.close()
+            else:
+                # Cancel - do nothing
+                event.ignore()
+        else:
+            # No tray icon available, just close normally
+            self._force_close = True
+            self.close()
+
+    def changeEvent(self, event):
+        """Handle window state changes (minimize)"""
+        if event.type() == QtCore.QEvent.WindowStateChange:
+            if self.isMinimized():
+                # Ask user if they want to minimize to tray
+                if hasattr(self, 'tray_icon') and QSystemTrayIcon.isSystemTrayAvailable():
+                    msg_box = QMessageBox(self)
+                    msg_box.setWindowTitle("TLOPO Looter")
+                    msg_box.setText("Minimize to system tray?")
+                    msg_box.setIcon(QMessageBox.Question)
+
+                    tray_btn = msg_box.addButton("Minimize to Tray", QMessageBox.YesRole)
+                    taskbar_btn = msg_box.addButton("Keep in Taskbar", QMessageBox.NoRole)
+
+                    msg_box.exec_()
+
+                    if msg_box.clickedButton() == tray_btn:
+                        event.ignore()
+                        self._minimize_to_tray()
+                        return
+
+        super().changeEvent(event)
 
 
 def _build_shared_state():
