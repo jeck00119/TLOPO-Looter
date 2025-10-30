@@ -122,6 +122,43 @@ def ensure_data_directories(session_folder=None):
         os.makedirs(target, exist_ok=True)
 
 
+def ensure_directory_exists(path):
+    """
+    Create directory if it doesn't exist.
+    Returns: (success, error_message)
+    """
+    if os.path.exists(path):
+        return (True, None)
+    try:
+        os.makedirs(path)
+        return (True, None)
+    except Exception as e:
+        return (False, str(e))
+
+
+def get_screenshot_path(session_folder, filename, legendary=False, fallback=False):
+    """
+    Construct screenshot path for given session and filename.
+    Args:
+        session_folder: Session folder name (e.g., 'Session_30-10-2025_14.30.45')
+        filename: Base filename (e.g., 'Legendary_1.jpg' or '1.jpg')
+        legendary: If True, saves to Legendary Loot folder
+        fallback: If True, appends '_FALLBACK' to filename
+    Returns: Absolute path to screenshot file
+    """
+    if fallback:
+        base, ext = os.path.splitext(filename)
+        filename = f"{base}_FALLBACK{ext}"
+
+    subfolder = 'Legendary Loot' if legendary else 'Regular Loot'
+    return get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\{subfolder}\\{filename}')
+
+
+def get_info_path(session_folder, filename):
+    """Construct path for legendary info text file"""
+    return get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot\\{filename}')
+
+
 def _initial_image_index():
     """
     Returns initial image index for a new session.
@@ -134,35 +171,258 @@ img_dir = resource_path("img")
 # current_img moved inside run_bot() to prevent race conditions
 
 
+# ===========================
+# WINDOW UTILITY FUNCTIONS
+# ===========================
+
 def check_window():
     """
-    Checks if game window exists and auto-resizes to required resolution.
-    Returns window handle if valid, 0 if not found/invalid.
+    Checks if game window exists and auto-corrects size if needed.
+    Returns window handle if found, 0 if not found.
 
-    IMPORTANT: Game must run at exactly 1280x800 for click coordinates to work.
-    Auto-restores minimized window and resizes to correct dimensions.
+    During startup validation: Called from subprocess (no PyQt5 interference).
+    During bot operation: Called from bot process (no PyQt5 interference).
+    Both contexts are safe for resize.
     """
     try:
         handle = gui.FindWindow(None, GAME_WINDOW_TITLE)
         if not handle:
             return 0
 
-        client_rect = gui.GetClientRect(handle)
-        if client_rect[2] == GAME_RESOLUTION[0] and client_rect[3] == GAME_RESOLUTION[1]:
-            return handle
-
-        # Window exists but wrong size - fix it
+        # Restore if minimized
         left, top, right, bottom = gui.GetClientRect(handle)
         if right == 0 and bottom == 0:
             gui.ShowWindow(handle, win32con.SW_SHOWNORMAL)
-        x0, y0, x1, y1 = gui.GetWindowRect(handle)
-        gui.MoveWindow(handle, x0, y0,
-                      GAME_RESOLUTION[0] + WINDOW_BORDER_OFFSET[0],
-                      GAME_RESOLUTION[1] + WINDOW_BORDER_OFFSET[1], True)
+            sleep(0.1)  # Give window time to restore
+
+        # Auto-correct window size if it's wrong (e.g., user resized it)
+        # Only do quick correction (1 iteration) to not slow down bot
+        client_rect = gui.GetClientRect(handle)
+        current_w = client_rect[2]
+        current_h = client_rect[3]
+
+        # Check if size is significantly wrong (>10px off)
+        error_w = abs(GAME_RESOLUTION[0] - current_w)
+        error_h = abs(GAME_RESOLUTION[1] - current_h)
+
+        if error_w > 10 or error_h > 10:
+            # Size is wrong, do quick correction
+            x0, y0, x1, y1 = gui.GetWindowRect(handle)
+            window_w = x1 - x0
+            window_h = y1 - y0
+
+            # Calculate correction
+            correction_w = GAME_RESOLUTION[0] - current_w
+            correction_h = GAME_RESOLUTION[1] - current_h
+
+            # Apply correction
+            new_w = window_w + correction_w
+            new_h = window_h + correction_h
+
+            gui.MoveWindow(handle, x0, y0, new_w, new_h, True)
+            sleep(0.1)
+
         return handle
 
     except Exception:
         return 0
+
+
+def resize_window_iterative(handle, max_iterations=3):
+    """
+    Resize window using iterative error correction.
+    Returns True if successful (within ±10px tolerance), False otherwise.
+
+    This is the method that worked in window_fix_tool.py testing.
+    """
+    try:
+        TOLERANCE = 10
+
+        for i in range(max_iterations):
+            # Get current client size
+            client_rect = gui.GetClientRect(handle)
+            client_w = client_rect[2]
+            client_h = client_rect[3]
+
+            # Calculate error
+            error_w = GAME_RESOLUTION[0] - client_w
+            error_h = GAME_RESOLUTION[1] - client_h
+
+            # Check if within tolerance
+            if abs(error_w) <= TOLERANCE and abs(error_h) <= TOLERANCE:
+                return True
+
+            # Check if exact
+            if error_w == 0 and error_h == 0:
+                return True
+
+            # Get current window size and adjust by error
+            x0, y0, x1, y1 = gui.GetWindowRect(handle)
+            window_w = x1 - x0
+            window_h = y1 - y0
+
+            new_window_w = window_w + error_w
+            new_window_h = window_h + error_h
+
+            # Resize window
+            gui.MoveWindow(handle, x0, y0, new_window_w, new_window_h, True)
+            sleep(0.15)  # Match test script timing exactly
+
+        # Check final size
+        client_rect = gui.GetClientRect(handle)
+        client_w = client_rect[2]
+        client_h = client_rect[3]
+        error_w = abs(GAME_RESOLUTION[0] - client_w)
+        error_h = abs(GAME_RESOLUTION[1] - client_h)
+
+        return error_w <= TOLERANCE and error_h <= TOLERANCE
+
+    except Exception as e:
+        return False
+
+
+def check_dpi_settings(hwnd):
+    """
+    Check if window dimensions are correct (indicates proper DPI settings).
+    Accepts dimensions within ±10 pixels tolerance to account for window borders
+    and minor DPI quirks. Requires DPI override set to "System" in game properties.
+    Returns: (is_correct, error_message)
+    """
+    try:
+        # Get actual client area dimensions
+        client_rect = gui.GetClientRect(hwnd)
+        actual_width = client_rect[2]
+        actual_height = client_rect[3]
+        expected_width, expected_height = GAME_RESOLUTION  # (1280, 800)
+
+        # Calculate pixel difference
+        width_diff = abs(actual_width - expected_width)
+        height_diff = abs(actual_height - expected_height)
+
+        # Allow ±10 pixels tolerance for window borders and DPI quirks
+        TOLERANCE = 10
+
+        # If dimensions are exact or within tolerance
+        if actual_width == expected_width and actual_height == expected_height:
+            return (True, f"Resolution OK: Client area is {actual_width}x{actual_height}")
+        elif width_diff <= TOLERANCE and height_diff <= TOLERANCE:
+            # Close enough - show warning but don't block
+            return (True,
+                   f"Resolution OK (within tolerance): Client area is {actual_width}x{actual_height}, "
+                   f"expected {expected_width}x{expected_height}. "
+                   f"Difference: {width_diff}x{height_diff} pixels (tolerance: ±{TOLERANCE}px)")
+        else:
+            # Too far off - block startup
+            return (False,
+                   f"Window dimensions incorrect. Client area is {actual_width}x{actual_height}, "
+                   f"expected {expected_width}x{expected_height} (±{TOLERANCE}px tolerance).\n\n"
+                   f"Troubleshooting:\n"
+                   f"1. Set game to 1280x800 resolution in-game graphics settings\n"
+                   f"2. Make sure game is in windowed mode (not fullscreen)\n"
+                   f"3. Restart the bot to trigger auto-resize\n\n"
+                   f"Note: Bot attempts automatic resize but Windows display scaling\n"
+                   f"at {actual_width}x{actual_height} suggests game is DPI-unaware.\n"
+                   f"Try setting game .exe compatibility: 'Override high DPI scaling' = 'System'")
+
+    except Exception as e:
+        # If check fails, don't block startup - log warning instead
+        return (True, f"Resolution check skipped: {e}")
+
+
+# ===========================
+# END WINDOW UTILITIES
+# ===========================
+
+
+def validate_game_ready():
+    """
+    Validate all requirements before starting bot.
+    Returns: (success, error_message, details)
+    """
+    details = {}
+
+    # Check 1: Game window exists
+    handle = check_window()
+    if not handle:
+        return (False, "Game window not detected. Please start the game.", details)
+    details['window_handle'] = handle
+
+    # Record initial window size before resize
+    initial_rect = gui.GetClientRect(handle)
+    initial_w = initial_rect[2]
+    initial_h = initial_rect[3]
+    details['initial_size'] = f"{initial_w}x{initial_h}"
+
+    # Check 2: Attempt to resize window to target resolution
+    # Uses the iterative method that worked in window_fix_tool.py testing
+    # Use 5 iterations (same as test script) to ensure resize completes
+    resize_success = resize_window_iterative(handle, max_iterations=5)
+    details['resize_attempted'] = True
+    details['resize_success'] = resize_success
+
+    # Give window time to settle after resize
+    sleep(0.2)
+
+    # Check 3: Validate window dimensions
+    # Accepts dimensions within ±10px tolerance (e.g., 1279x799 is acceptable)
+    dpi_correct, dpi_msg = check_dpi_settings(handle)
+    details['dpi_message'] = dpi_msg
+    if not dpi_correct:
+        # Resize failed to get within tolerance
+        # Add diagnostic info to error message
+        final_rect = gui.GetClientRect(handle)
+        final_w = final_rect[2]
+        final_h = final_rect[3]
+        details['final_size'] = f"{final_w}x{final_h}"
+
+        enhanced_msg = f"{dpi_msg}\n\nDiagnostics:\n"
+        enhanced_msg += f"  Initial size: {initial_w}x{initial_h}\n"
+        enhanced_msg += f"  After {5} resize iterations: {final_w}x{final_h}\n"
+        enhanced_msg += f"  Target: {GAME_RESOLUTION[0]}x{GAME_RESOLUTION[1]}"
+
+        return (False, enhanced_msg, details)
+
+    # If we reached here, dimensions are acceptable (1280x800 ±10px)
+    details['resolution_ok'] = True
+
+    # Check 4: Template images exist
+    img_dir = resource_path("img")
+    required_templates = [
+        'open_loot.jpg',
+        'loot_window.jpg',
+        'full_hp.jpg',
+        'damaged_hp.jpg',
+        'empty_hp.jpg'
+    ]
+
+    missing_templates = []
+    for template in required_templates:
+        template_path = os.path.join(img_dir, template)
+        if not os.path.exists(template_path):
+            missing_templates.append(template)
+
+    if missing_templates:
+        details['missing_templates'] = missing_templates
+        return (False, f"Required template images missing from img/ folder: {', '.join(missing_templates)}", details)
+
+    details['templates_ok'] = True
+
+    # Check 5: Data folder writable
+    try:
+        test_dir = get_data_path('Data')
+        os.makedirs(test_dir, exist_ok=True)
+
+        # Try creating a test file
+        test_file = os.path.join(test_dir, '.write_test')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        details['data_folder_writable'] = True
+    except Exception as e:
+        return (False, f"Cannot write to Data/ folder. Check permissions. Error: {e}", details)
+
+    # All checks passed
+    return (True, "All validation checks passed", details)
 
 
 def press_left_click(x, y):
@@ -286,7 +546,7 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
                 notify("status", f"💎 Legendary item detected at position ({legendary_x}, {legendary_y}).")
                 legendary_path = None
                 if save_screenshots:
-                    legendary_path = get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot\\Legendary_{current_img}.jpg')
+                    legendary_path = get_screenshot_path(session_folder, f'Legendary_{current_img}.jpg', legendary=True)
                     cv2.imwrite(legendary_path, frame)
                     notify("status", f"📸 Screenshot saved: Legendary_{current_img}.jpg")
 
@@ -340,7 +600,7 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
 
                     # Save fallback screenshot
                     if save_screenshots:
-                        fallback_path = get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot\\Legendary_{current_img}_FALLBACK.jpg')
+                        fallback_path = get_screenshot_path(session_folder, f'Legendary_{current_img}.jpg', legendary=True, fallback=True)
                         cv2.imwrite(fallback_path, verification_frame)
                         notify("status", f"📷 Fallback screenshot saved: Legendary_{current_img}_FALLBACK.jpg")
 
@@ -355,7 +615,7 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
 
                 info_path = None
                 if save_screenshots:
-                    info_path = get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot\\Legendary_Info_{current_img}.txt')
+                    info_path = get_info_path(session_folder, f'Legendary_Info_{current_img}.txt')
                     with open(info_path, 'a') as f_handle:
                         f_handle.write(f'################################################\n'
                                        f'Legendary_{current_img}\n'
@@ -375,7 +635,7 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
             else:
                 notify("status", "📦 No legendary items detected, regular loot only.")
                 if save_screenshots:
-                    regular_path = get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Regular Loot\\{current_img}.jpg')
+                    regular_path = get_screenshot_path(session_folder, f'{current_img}.jpg', legendary=False)
                     cv2.imwrite(regular_path, frame)
                     notify("status", f"📄 Regular loot screenshot saved: {current_img}.jpg")
 

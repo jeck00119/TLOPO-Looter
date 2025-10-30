@@ -673,9 +673,68 @@ class BotWindow(QtWidgets.QMainWindow):
         self._force_close = True
         self.close()
 
+    def _validate_startup_requirements(self):
+        """
+        Validate all requirements before starting bot.
+        Runs in separate process to avoid PyQt5 event loop interference.
+        Returns: (success, error_message)
+        """
+        try:
+            # Run validation in subprocess to avoid PyQt5 event loop interference
+            # PyQt5's event loop causes window resize to fail
+            import subprocess
+            import sys
+
+            # Run validation script directly
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import bot_logic; success, msg, details = bot_logic.validate_game_ready(); print('SUCCESS' if success else f'FAIL:{msg}')"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            # Get last line only (ignore any debug output)
+            lines = result.stdout.strip().split('\n')
+            last_line = lines[-1] if lines else ''
+
+            if last_line == 'SUCCESS':
+                return (True, "Validation passed")
+            elif last_line.startswith('FAIL:'):
+                return (False, last_line[5:])  # Remove 'FAIL:' prefix
+            else:
+                return (False, f"Validation error: {last_line if last_line else 'No output'}")
+
+        except subprocess.TimeoutExpired:
+            return (False, "Validation timeout")
+        except Exception as e:
+            return (False, f"Validation error: {e}")
+
+    def _show_validation_error(self, error_message):
+        """Show error dialog and switch to Help tab"""
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Critical)
+        msg_box.setWindowTitle("Startup Validation Failed")
+        msg_box.setText(error_message)
+        msg_box.setInformativeText("Please check the Help tab for setup instructions.")
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec_()
+
+        # Switch to Help tab (index 2: Overview=0, Advanced=1, Help=2)
+        self.tab_widget.setCurrentIndex(2)
+
+        # Log the validation failure
+        self._append_log(f"Startup blocked: {error_message}")
+
     def _handle_start_clicked(self):
         if self._bot_is_running():
             self._append_log("Bot is already running.")
+            return
+
+        # Validate before starting
+        is_valid, error_msg = self._validate_startup_requirements()
+        if not is_valid:
+            self._show_validation_error(error_msg)
             return
 
         try:
@@ -794,13 +853,13 @@ class BotWindow(QtWidgets.QMainWindow):
             self._append_log(f"Error finding latest session: {e}")
 
         # Create folder if it doesn't exist
-        if not os.path.exists(folder_to_open):
-            try:
-                os.makedirs(folder_to_open)
-                self._append_log(f"Created screenshot folder: {folder_to_open}")
-            except Exception as e:
-                self._append_log(f"Error creating folder: {e}")
-                return
+        folder_existed = os.path.exists(folder_to_open)
+        success, error = bot_logic.ensure_directory_exists(folder_to_open)
+        if not success:
+            self._append_log(f"Error creating folder: {error}")
+            return
+        if not folder_existed:
+            self._append_log(f"Created screenshot folder: {folder_to_open}")
 
         # Open folder in Explorer
         try:
