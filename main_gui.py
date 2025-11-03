@@ -218,6 +218,94 @@ QTextBrowser:focus {
 }
 """
 
+
+class DetectionOverlayWindow(QtWidgets.QWidget):
+    """
+    Window that displays the game window with detection zones overlaid.
+    Green rectangles = detection found
+    Red rectangles = no detection
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("TLOPO Looter - Detection Overlay")
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
+
+        # Store latest detection data
+        self.game_image = None
+        self.detection_zones = {}  # {zone_name: {'rect': (x, y, w, h), 'detected': bool}}
+
+        # Create display label
+        self.image_label = QtWidgets.QLabel()
+        self.image_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.image_label.setStyleSheet("background-color: #000000;")
+
+        # Layout
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(self.image_label)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        # Initial size
+        self.resize(800, 600)
+
+    def update_detection_data(self, game_image, zones):
+        """
+        Update the overlay with new detection data.
+        Args:
+            game_image: numpy array of game window screenshot (BGR format)
+            zones: dict of {zone_name: {'x': x, 'y': y, 'w': w, 'h': h, 'detected': bool}}
+        """
+        import cv2
+        import numpy as np
+
+        if game_image is None:
+            return
+
+        # Create a copy to draw on
+        overlay_image = game_image.copy()
+
+        # Draw rectangles for each detection zone
+        for zone_name, zone_data in zones.items():
+            x = zone_data.get('x', 0)
+            y = zone_data.get('y', 0)
+            w = zone_data.get('w', 0)
+            h = zone_data.get('h', 0)
+            detected = zone_data.get('detected', False)
+
+            # Choose color: Green if detected, Red if not
+            color = (0, 255, 0) if detected else (0, 0, 255)  # BGR format
+
+            # Draw rectangle
+            cv2.rectangle(overlay_image, (x, y), (x + w, y + h), color, 2)
+
+            # Draw label with background
+            label = f"{zone_name}: {'DETECTED' if detected else 'NOT FOUND'}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+            # Draw background rectangle for text
+            cv2.rectangle(overlay_image, (x, y - text_height - 10), (x + text_width + 10, y), color, -1)
+
+            # Draw text
+            text_color = (255, 255, 255)  # White text
+            cv2.putText(overlay_image, label, (x + 5, y - 5), font, font_scale, text_color, thickness)
+
+        # Convert BGR to RGB for Qt
+        rgb_image = cv2.cvtColor(overlay_image, cv2.COLOR_BGR2RGB)
+
+        # Convert to QImage
+        height, width, channel = rgb_image.shape
+        bytes_per_line = 3 * width
+        q_image = QtGui.QImage(rgb_image.data, width, height, bytes_per_line, QtGui.QImage.Format_RGB888)
+
+        # Update label
+        pixmap = QtGui.QPixmap.fromImage(q_image)
+        self.image_label.setPixmap(pixmap)
+        self.resize(width, height)
+
+
 class BotWindow(QtWidgets.QMainWindow):
     STATUS_POLL_INTERVAL_MS = 500
 
@@ -230,6 +318,26 @@ class BotWindow(QtWidgets.QMainWindow):
         self.loot_opened = shared_state["loot_opened"]
         self.legendaries = shared_state["legendaries"]
         self.screenshot_enabled = shared_state["screenshot_enabled"]
+        # Template matching thresholds
+        self.threshold_open_loot = shared_state["threshold_open_loot"]
+        self.threshold_loot_window = shared_state["threshold_loot_window"]
+        self.threshold_hp_full = shared_state["threshold_hp_full"]
+        self.threshold_hp_damaged = shared_state["threshold_hp_damaged"]
+        self.threshold_hp_empty = shared_state["threshold_hp_empty"]
+        # Debug options
+        self.debug_mode = shared_state["debug_mode"]
+        self.show_coords = shared_state["show_coords"]
+        self.show_confidence = shared_state["show_confidence"]
+        # Debug capture selection
+        self.debug_capture_open_loot_flag = shared_state["debug_capture_open_loot"]
+        self.debug_capture_loot_window_flag = shared_state["debug_capture_loot_window"]
+        self.debug_capture_hp_full_flag = shared_state["debug_capture_hp_full"]
+        self.debug_capture_hp_damaged_flag = shared_state["debug_capture_hp_damaged"]
+        self.debug_capture_hp_empty_flag = shared_state["debug_capture_hp_empty"]
+        # Manual capture trigger
+        self.manual_capture_trigger = shared_state["manual_capture_trigger"]
+        # Detection overlay
+        self.overlay_enabled = shared_state["overlay_enabled"]
 
         self.status_queue = multiprocessing.Queue()
         self.process = None
@@ -238,6 +346,9 @@ class BotWindow(QtWidgets.QMainWindow):
         self._syncing_controls = False
         self._last_started_state = bool(self.started_flag.value)
         self._force_close = False  # Flag to force exit without tray
+
+        # Detection overlay window
+        self.overlay_window = None
 
         self._init_window()
         self._build_ui()
@@ -428,6 +539,50 @@ class BotWindow(QtWidgets.QMainWindow):
         screenshot_group.setLayout(screenshot_layout)
         advanced_layout.addWidget(screenshot_group)
 
+        # Note about thresholds moved to Debug tab
+        thresholds_note = QtWidgets.QLabel("🐛 Template matching thresholds moved to Debug tab")
+        thresholds_note.setStyleSheet("color: #66d9ff; font-size: 10pt; padding: 10px; background-color: #03101d; border-radius: 5px;")
+        advanced_layout.addWidget(thresholds_note)
+
+        # Create threshold spinboxes here (they'll be moved to Debug tab layout later)
+        self.threshold_open_loot_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_open_loot_spin.setDecimals(2)
+        self.threshold_open_loot_spin.setRange(0.10, 1.0)
+        self.threshold_open_loot_spin.setSingleStep(0.05)
+        self.threshold_open_loot_spin.setValue(float(self.threshold_open_loot.value))
+        self.threshold_open_loot_spin.setToolTip("Default: 0.40 | Detects 'Press SHIFT to open' prompt")
+
+        self.threshold_loot_window_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_loot_window_spin.setDecimals(2)
+        self.threshold_loot_window_spin.setRange(0.10, 1.0)
+        self.threshold_loot_window_spin.setSingleStep(0.05)
+        self.threshold_loot_window_spin.setValue(float(self.threshold_loot_window.value))
+        self.threshold_loot_window_spin.setToolTip("Default: 0.35 | Detects loot chest window UI")
+
+        self.threshold_hp_full_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_hp_full_spin.setDecimals(2)
+        self.threshold_hp_full_spin.setRange(0.10, 1.0)
+        self.threshold_hp_full_spin.setSingleStep(0.05)
+        self.threshold_hp_full_spin.setValue(float(self.threshold_hp_full.value))
+        self.threshold_hp_full_spin.setToolTip("Default: 0.85 | Detects enemy with full HP")
+
+        self.threshold_hp_damaged_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_hp_damaged_spin.setDecimals(2)
+        self.threshold_hp_damaged_spin.setRange(0.10, 1.0)
+        self.threshold_hp_damaged_spin.setSingleStep(0.05)
+        self.threshold_hp_damaged_spin.setValue(float(self.threshold_hp_damaged.value))
+        self.threshold_hp_damaged_spin.setToolTip("Default: 0.95 | Detects enemy with damaged HP")
+
+        self.threshold_hp_empty_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_hp_empty_spin.setDecimals(2)
+        self.threshold_hp_empty_spin.setRange(0.10, 1.0)
+        self.threshold_hp_empty_spin.setSingleStep(0.05)
+        self.threshold_hp_empty_spin.setValue(float(self.threshold_hp_empty.value))
+        self.threshold_hp_empty_spin.setToolTip("Default: 0.90 | Detects enemy with empty HP")
+
+        self.reset_thresholds_button = QtWidgets.QPushButton("Reset Thresholds to Defaults")
+        self.reset_thresholds_button.setObjectName("resetThresholdsButton")
+
         log_group = QtWidgets.QGroupBox("Event Log")
         log_layout = QtWidgets.QVBoxLayout()
         self.log_view = QtWidgets.QPlainTextEdit()
@@ -562,6 +717,185 @@ class BotWindow(QtWidgets.QMainWindow):
         help_layout.addWidget(help_text)
         self.tab_widget.addTab(help_page, "❓ Help")
 
+        # Debug Tab
+        debug_page = QtWidgets.QWidget()
+        debug_layout = QtWidgets.QVBoxLayout(debug_page)
+        debug_layout.setContentsMargins(6, 6, 6, 6)
+        debug_layout.setSpacing(8)
+
+        # Threshold controls (now in Debug tab)
+        debug_threshold_group = QtWidgets.QGroupBox("🎯 Template Matching Thresholds")
+        debug_threshold_layout = QtWidgets.QGridLayout()
+        debug_threshold_layout.setHorizontalSpacing(12)
+        debug_threshold_layout.setVerticalSpacing(8)
+
+        # Info label
+        threshold_info = QtWidgets.QLabel("⚠️ Range: 0.10 (very lenient) to 1.00 (strict)\n"
+                                         "Lower = easier detection, more false positives\n"
+                                         "At 1024x768: Try 0.20-0.30 for Open Loot and Loot Window")
+        threshold_info.setStyleSheet("color: #ffa500; font-size: 9pt; padding: 5px;")
+        debug_threshold_layout.addWidget(threshold_info, 0, 0, 1, 2)
+
+        # Reference existing spinboxes (already created in Advanced tab)
+        row = 1
+        debug_threshold_layout.addWidget(QtWidgets.QLabel("Open Loot Detection"), row, 0)
+        debug_threshold_layout.addWidget(self.threshold_open_loot_spin, row, 1)
+        row += 1
+
+        debug_threshold_layout.addWidget(QtWidgets.QLabel("Loot Window Detection"), row, 0)
+        debug_threshold_layout.addWidget(self.threshold_loot_window_spin, row, 1)
+        row += 1
+
+        debug_threshold_layout.addWidget(QtWidgets.QLabel("HP Full Detection"), row, 0)
+        debug_threshold_layout.addWidget(self.threshold_hp_full_spin, row, 1)
+        row += 1
+
+        debug_threshold_layout.addWidget(QtWidgets.QLabel("HP Damaged Detection"), row, 0)
+        debug_threshold_layout.addWidget(self.threshold_hp_damaged_spin, row, 1)
+        row += 1
+
+        debug_threshold_layout.addWidget(QtWidgets.QLabel("HP Empty Detection"), row, 0)
+        debug_threshold_layout.addWidget(self.threshold_hp_empty_spin, row, 1)
+        row += 1
+
+        # Reset button
+        debug_threshold_layout.addWidget(self.reset_thresholds_button, row, 0, 1, 2)
+
+        debug_threshold_group.setLayout(debug_threshold_layout)
+        debug_layout.addWidget(debug_threshold_group)
+
+        # Debug Visualization Options
+        debug_viz_group = QtWidgets.QGroupBox("🔍 Detection Visualization")
+        debug_viz_layout = QtWidgets.QVBoxLayout()
+        debug_viz_layout.setSpacing(8)
+
+        # Enable debug mode
+        self.debug_mode_checkbox = QtWidgets.QCheckBox("Enable Debug Mode (saves detection screenshots)")
+        self.debug_mode_checkbox.setChecked(False)
+        self.debug_mode_checkbox.setToolTip("Saves screenshots of each detection attempt to Data/Debug/ folder")
+        debug_viz_layout.addWidget(self.debug_mode_checkbox)
+
+        # Show click coordinates
+        self.show_coords_checkbox = QtWidgets.QCheckBox("Log click coordinates in Event Log")
+        self.show_coords_checkbox.setChecked(False)
+        self.show_coords_checkbox.setToolTip("Shows exact X,Y coordinates where bot clicks")
+        debug_viz_layout.addWidget(self.show_coords_checkbox)
+
+        # Show detection confidence
+        self.show_confidence_checkbox = QtWidgets.QCheckBox("Log template match confidence scores")
+        self.show_confidence_checkbox.setChecked(False)
+        self.show_confidence_checkbox.setToolTip("Shows how confident the bot is about each detection (0.0-1.0)")
+        debug_viz_layout.addWidget(self.show_confidence_checkbox)
+
+        # Add separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        debug_viz_layout.addWidget(separator)
+
+        # Debug capture selection label
+        capture_label = QtWidgets.QLabel("📷 Select which detections to capture (when Debug Mode enabled):")
+        capture_label.setStyleSheet("color: #ffa500; font-weight: bold; margin-top: 5px;")
+        debug_viz_layout.addWidget(capture_label)
+
+        # Checkboxes for each detection type
+        self.debug_capture_open_loot = QtWidgets.QCheckBox("Capture Open Loot prompt")
+        self.debug_capture_open_loot.setChecked(True)
+        debug_viz_layout.addWidget(self.debug_capture_open_loot)
+
+        self.debug_capture_loot_window = QtWidgets.QCheckBox("Capture Loot Window")
+        self.debug_capture_loot_window.setChecked(True)
+        debug_viz_layout.addWidget(self.debug_capture_loot_window)
+
+        self.debug_capture_hp_full = QtWidgets.QCheckBox("Capture Enemy HP (Full)")
+        self.debug_capture_hp_full.setChecked(False)
+        debug_viz_layout.addWidget(self.debug_capture_hp_full)
+
+        self.debug_capture_hp_damaged = QtWidgets.QCheckBox("Capture Enemy HP (Damaged)")
+        self.debug_capture_hp_damaged.setChecked(False)
+        debug_viz_layout.addWidget(self.debug_capture_hp_damaged)
+
+        self.debug_capture_hp_empty = QtWidgets.QCheckBox("Capture Enemy HP (Empty)")
+        self.debug_capture_hp_empty.setChecked(False)
+        debug_viz_layout.addWidget(self.debug_capture_hp_empty)
+
+        # Capture current state button
+        self.capture_state_button = QtWidgets.QPushButton("📸 Capture Current Detection State")
+        self.capture_state_button.setObjectName("captureStateButton")
+        self.capture_state_button.setToolTip("Saves screenshots of all detection zones RIGHT NOW for inspection")
+        debug_viz_layout.addWidget(self.capture_state_button)
+
+        # Open debug folder button
+        self.open_debug_folder_button = QtWidgets.QPushButton("📂 Open Debug Screenshot Folder")
+        self.open_debug_folder_button.setObjectName("openDebugFolderButton")
+        debug_viz_layout.addWidget(self.open_debug_folder_button)
+
+        # Add separator
+        separator2 = QtWidgets.QFrame()
+        separator2.setFrameShape(QtWidgets.QFrame.HLine)
+        separator2.setFrameShadow(QtWidgets.QFrame.Sunken)
+        debug_viz_layout.addWidget(separator2)
+
+        # Detection overlay window button
+        self.show_overlay_button = QtWidgets.QPushButton("🎯 Show Detection Overlay Window")
+        self.show_overlay_button.setObjectName("showOverlayButton")
+        self.show_overlay_button.setToolTip("Opens real-time window showing detection zones (Green = detected, Red = not detected)")
+        self.show_overlay_button.setCheckable(True)
+        self.show_overlay_button.setChecked(False)
+        debug_viz_layout.addWidget(self.show_overlay_button)
+
+        debug_viz_group.setLayout(debug_viz_layout)
+        debug_layout.addWidget(debug_viz_group)
+
+        # Detection Info Display
+        debug_info_group = QtWidgets.QGroupBox("📊 Current Detection Info")
+        debug_info_layout = QtWidgets.QGridLayout()
+        debug_info_layout.setHorizontalSpacing(12)
+        debug_info_layout.setVerticalSpacing(6)
+
+        # Resolution info
+        debug_info_layout.addWidget(QtWidgets.QLabel("Game Resolution:"), 0, 0)
+        self.debug_resolution_label = QtWidgets.QLabel("Not detected yet")
+        self.debug_resolution_label.setStyleSheet("color: #66d9ff; font-weight: bold;")
+        debug_info_layout.addWidget(self.debug_resolution_label, 0, 1)
+
+        # Scale factors
+        debug_info_layout.addWidget(QtWidgets.QLabel("Scale Factors:"), 1, 0)
+        self.debug_scale_label = QtWidgets.QLabel("Not detected yet")
+        self.debug_scale_label.setStyleSheet("color: #66d9ff; font-weight: bold;")
+        debug_info_layout.addWidget(self.debug_scale_label, 1, 1)
+
+        # Last detection
+        debug_info_layout.addWidget(QtWidgets.QLabel("Last Detection:"), 2, 0)
+        self.debug_last_detection_label = QtWidgets.QLabel("None")
+        self.debug_last_detection_label.setStyleSheet("color: #46ff9a; font-weight: bold;")
+        debug_info_layout.addWidget(self.debug_last_detection_label, 2, 1)
+
+        # Last click
+        debug_info_layout.addWidget(QtWidgets.QLabel("Last Click:"), 3, 0)
+        self.debug_last_click_label = QtWidgets.QLabel("None")
+        self.debug_last_click_label.setStyleSheet("color: #46ff9a; font-weight: bold;")
+        debug_info_layout.addWidget(self.debug_last_click_label, 3, 1)
+
+        debug_info_group.setLayout(debug_info_layout)
+        debug_layout.addWidget(debug_info_group)
+
+        # Debug hints
+        debug_hints = QtWidgets.QLabel(
+            "💡 Troubleshooting Tips:\n"
+            "• At 1024x768: Lower Open Loot to 0.20-0.25, Loot Window to 0.15-0.20\n"
+            "• Enable Debug Mode to see what the bot sees\n"
+            "• Check 'Log coordinates' to verify click positions\n"
+            "• Use 'Capture State' button when bot should detect something but doesn't"
+        )
+        debug_hints.setStyleSheet("color: #8af7ff; font-size: 9pt; padding: 10px; background-color: #03101d; border-radius: 5px;")
+        debug_hints.setWordWrap(True)
+        debug_layout.addWidget(debug_hints)
+
+        debug_layout.addStretch()
+
+        self.tab_widget.addTab(debug_page, "🐛 Debug")
+
         self._update_status_labels(initial=True)
 
     def _connect_signals(self):
@@ -575,6 +909,28 @@ class BotWindow(QtWidgets.QMainWindow):
 
         self.screenshot_checkbox.stateChanged.connect(self._handle_screenshot_toggled)
         self.open_folder_button.clicked.connect(self._handle_open_folder)
+
+        # Threshold spinbox signals
+        self.threshold_open_loot_spin.valueChanged.connect(self._handle_threshold_open_loot_changed)
+        self.threshold_loot_window_spin.valueChanged.connect(self._handle_threshold_loot_window_changed)
+        self.threshold_hp_full_spin.valueChanged.connect(self._handle_threshold_hp_full_changed)
+        self.threshold_hp_damaged_spin.valueChanged.connect(self._handle_threshold_hp_damaged_changed)
+        self.threshold_hp_empty_spin.valueChanged.connect(self._handle_threshold_hp_empty_changed)
+        self.reset_thresholds_button.clicked.connect(self._handle_reset_thresholds)
+
+        # Debug signals
+        self.debug_mode_checkbox.stateChanged.connect(self._handle_debug_mode_toggled)
+        self.show_coords_checkbox.stateChanged.connect(self._handle_show_coords_toggled)
+        self.show_confidence_checkbox.stateChanged.connect(self._handle_show_confidence_toggled)
+        self.capture_state_button.clicked.connect(self._handle_capture_state)
+        self.open_debug_folder_button.clicked.connect(self._handle_open_debug_folder)
+        self.show_overlay_button.toggled.connect(self._handle_show_overlay_toggled)
+        # Debug capture selection signals
+        self.debug_capture_open_loot.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('open_loot', state))
+        self.debug_capture_loot_window.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('loot_window', state))
+        self.debug_capture_hp_full.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('hp_full', state))
+        self.debug_capture_hp_damaged.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('hp_damaged', state))
+        self.debug_capture_hp_empty.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('hp_empty', state))
 
     def _start_status_timer(self):
         self.status_timer = QtCore.QTimer(self)
@@ -751,6 +1107,21 @@ class BotWindow(QtWidgets.QMainWindow):
                     self.legendaries,
                     self.status_queue,
                     self.screenshot_enabled,
+                    self.threshold_open_loot,
+                    self.threshold_loot_window,
+                    self.threshold_hp_full,
+                    self.threshold_hp_damaged,
+                    self.threshold_hp_empty,
+                    self.debug_mode,
+                    self.show_coords,
+                    self.show_confidence,
+                    self.debug_capture_open_loot_flag,
+                    self.debug_capture_loot_window_flag,
+                    self.debug_capture_hp_full_flag,
+                    self.debug_capture_hp_damaged_flag,
+                    self.debug_capture_hp_empty_flag,
+                    self.manual_capture_trigger,
+                    self.overlay_enabled,
                 ),
             )
             self.process.daemon = True
@@ -813,6 +1184,184 @@ class BotWindow(QtWidgets.QMainWindow):
             self.attack_delay.value = float(value)
         if self.attack_spin.hasFocus():
             self._append_log(f"Updated attack delay to {value:.3f}s.")
+
+    def _handle_threshold_open_loot_changed(self, value):
+        if self._syncing_controls:
+            return
+        with self.threshold_open_loot.get_lock():
+            self.threshold_open_loot.value = float(value)
+        if self.threshold_open_loot_spin.hasFocus():
+            self._append_log(f"Updated Open Loot threshold to {value:.2f}.")
+
+    def _handle_threshold_loot_window_changed(self, value):
+        if self._syncing_controls:
+            return
+        with self.threshold_loot_window.get_lock():
+            self.threshold_loot_window.value = float(value)
+        if self.threshold_loot_window_spin.hasFocus():
+            self._append_log(f"Updated Loot Window threshold to {value:.2f}.")
+
+    def _handle_threshold_hp_full_changed(self, value):
+        if self._syncing_controls:
+            return
+        with self.threshold_hp_full.get_lock():
+            self.threshold_hp_full.value = float(value)
+        if self.threshold_hp_full_spin.hasFocus():
+            self._append_log(f"Updated HP Full threshold to {value:.2f}.")
+
+    def _handle_threshold_hp_damaged_changed(self, value):
+        if self._syncing_controls:
+            return
+        with self.threshold_hp_damaged.get_lock():
+            self.threshold_hp_damaged.value = float(value)
+        if self.threshold_hp_damaged_spin.hasFocus():
+            self._append_log(f"Updated HP Damaged threshold to {value:.2f}.")
+
+    def _handle_threshold_hp_empty_changed(self, value):
+        if self._syncing_controls:
+            return
+        with self.threshold_hp_empty.get_lock():
+            self.threshold_hp_empty.value = float(value)
+        if self.threshold_hp_empty_spin.hasFocus():
+            self._append_log(f"Updated HP Empty threshold to {value:.2f}.")
+
+    def _handle_reset_thresholds(self):
+        defaults = {
+            "threshold_open_loot": 0.40,
+            "threshold_loot_window": 0.35,
+            "threshold_hp_full": 0.85,
+            "threshold_hp_damaged": 0.95,
+            "threshold_hp_empty": 0.90,
+        }
+        with self.threshold_open_loot.get_lock():
+            self.threshold_open_loot.value = defaults["threshold_open_loot"]
+        with self.threshold_loot_window.get_lock():
+            self.threshold_loot_window.value = defaults["threshold_loot_window"]
+        with self.threshold_hp_full.get_lock():
+            self.threshold_hp_full.value = defaults["threshold_hp_full"]
+        with self.threshold_hp_damaged.get_lock():
+            self.threshold_hp_damaged.value = defaults["threshold_hp_damaged"]
+        with self.threshold_hp_empty.get_lock():
+            self.threshold_hp_empty.value = defaults["threshold_hp_empty"]
+
+        self._syncing_controls = True
+        self.threshold_open_loot_spin.setValue(defaults["threshold_open_loot"])
+        self.threshold_loot_window_spin.setValue(defaults["threshold_loot_window"])
+        self.threshold_hp_full_spin.setValue(defaults["threshold_hp_full"])
+        self.threshold_hp_damaged_spin.setValue(defaults["threshold_hp_damaged"])
+        self.threshold_hp_empty_spin.setValue(defaults["threshold_hp_empty"])
+        self._syncing_controls = False
+        self._append_log("Threshold settings reset to defaults.")
+
+    def _handle_debug_mode_toggled(self, state):
+        """Handle debug mode checkbox toggle"""
+        is_enabled = (state == QtCore.Qt.Checked)
+        with self.debug_mode.get_lock():
+            self.debug_mode.value = is_enabled
+        status_text = "enabled" if is_enabled else "disabled"
+        self._append_log(f"Debug mode {status_text}. Detection screenshots will {'be saved' if is_enabled else 'NOT be saved'} to Data/Debug/")
+
+    def _handle_show_coords_toggled(self, state):
+        """Handle show coordinates checkbox toggle"""
+        is_enabled = (state == QtCore.Qt.Checked)
+        with self.show_coords.get_lock():
+            self.show_coords.value = is_enabled
+        status_text = "enabled" if is_enabled else "disabled"
+        self._append_log(f"Coordinate logging {status_text}.")
+
+    def _handle_show_confidence_toggled(self, state):
+        """Handle show confidence checkbox toggle"""
+        is_enabled = (state == QtCore.Qt.Checked)
+        with self.show_confidence.get_lock():
+            self.show_confidence.value = is_enabled
+        status_text = "enabled" if is_enabled else "disabled"
+        self._append_log(f"Confidence score logging {status_text}.")
+
+    def _handle_debug_capture_toggled(self, detection_type, state):
+        """Handle debug capture checkbox toggle"""
+        is_enabled = (state == QtCore.Qt.Checked)
+        flag_map = {
+            'open_loot': self.debug_capture_open_loot_flag,
+            'loot_window': self.debug_capture_loot_window_flag,
+            'hp_full': self.debug_capture_hp_full_flag,
+            'hp_damaged': self.debug_capture_hp_damaged_flag,
+            'hp_empty': self.debug_capture_hp_empty_flag,
+        }
+        if detection_type in flag_map:
+            with flag_map[detection_type].get_lock():
+                flag_map[detection_type].value = is_enabled
+            name_map = {
+                'open_loot': 'Open Loot',
+                'loot_window': 'Loot Window',
+                'hp_full': 'HP Full',
+                'hp_damaged': 'HP Damaged',
+                'hp_empty': 'HP Empty',
+            }
+            status = "enabled" if is_enabled else "disabled"
+            self._append_log(f"Debug capture for {name_map[detection_type]}: {status}")
+
+    def _handle_capture_state(self):
+        """Capture current detection state for debugging"""
+        if not self._bot_is_running():
+            self._append_log("❌ Cannot capture state: Bot is not running.")
+            return
+
+        # Trigger manual capture by incrementing the counter
+        with self.manual_capture_trigger.get_lock():
+            self.manual_capture_trigger.value += 1
+
+        self._append_log(f"📸 Manual capture triggered! Bot will save screenshots of all detection zones on next loop iteration.")
+        self._append_log(f"   Check Data/Debug/ folder for files with 'MANUAL' in the name.")
+
+    def _handle_open_debug_folder(self):
+        """Open the debug screenshot folder in Windows Explorer"""
+        import os
+        import subprocess
+
+        debug_folder = bot_logic.get_data_path('Data\\Debug')
+
+        # Create folder if it doesn't exist
+        folder_existed = os.path.exists(debug_folder)
+        success, error = bot_logic.ensure_directory_exists(debug_folder)
+        if not success:
+            self._append_log(f"Error creating debug folder: {error}")
+            return
+        if not folder_existed:
+            self._append_log(f"Created debug folder: {debug_folder}")
+
+        # Open folder in Explorer
+        try:
+            subprocess.Popen(f'explorer "{debug_folder}"')
+            self._append_log("Opened debug screenshot folder.")
+        except Exception as e:
+            self._append_log(f"Error opening debug folder: {e}")
+
+    def _handle_show_overlay_toggled(self, checked):
+        """Handle detection overlay window toggle"""
+        if not self._bot_is_running():
+            self._append_log("❌ Cannot show overlay: Bot is not running.")
+            self.show_overlay_button.setChecked(False)
+            return
+
+        if checked:
+            # Enable overlay data sending in bot
+            with self.overlay_enabled.get_lock():
+                self.overlay_enabled.value = True
+
+            # Create and show overlay window
+            if self.overlay_window is None:
+                self.overlay_window = DetectionOverlayWindow()
+            self.overlay_window.show()
+            self._append_log("✅ Detection overlay window opened. Green = detected, Red = not detected.")
+        else:
+            # Disable overlay data sending
+            with self.overlay_enabled.get_lock():
+                self.overlay_enabled.value = False
+
+            # Hide overlay window
+            if self.overlay_window:
+                self.overlay_window.hide()
+            self._append_log("Overlay window closed.")
 
     def _handle_screenshot_toggled(self, state):
         """Handle screenshot checkbox toggle"""
@@ -951,6 +1500,47 @@ class BotWindow(QtWidgets.QMainWindow):
             event_type = event.get("type", "status")
             message = event.get("message") or event_type.replace("_", " ").title()
 
+            # Update debug info labels
+            if event_type == "resolution_detected":
+                resolution = event.get("resolution")
+                scale_x = event.get("scale_x")
+                scale_y = event.get("scale_y")
+                if resolution:
+                    self.debug_resolution_label.setText(resolution)
+                if scale_x is not None and scale_y is not None:
+                    self.debug_scale_label.setText(f"{scale_x:.2f}x, {scale_y:.2f}x")
+
+            if event_type == "detection":
+                template_name = event.get("template")
+                confidence = event.get("confidence")
+                if template_name:
+                    display_text = template_name
+                    if confidence is not None and bool(self.show_confidence.value):
+                        display_text += f" ({confidence:.2f})"
+                    self.debug_last_detection_label.setText(display_text)
+
+            if event_type == "click":
+                x = event.get("x")
+                y = event.get("y")
+                if x is not None and y is not None:
+                    self.debug_last_click_label.setText(f"({x}, {y})")
+
+            # Handle detection overlay updates
+            if event_type == "detection_overlay":
+                if self.overlay_window and self.show_overlay_button.isChecked():
+                    import numpy as np
+                    # Decode the image data
+                    image_bytes = event.get("image")
+                    zones = event.get("zones", {})
+                    if image_bytes:
+                        # Convert bytes back to numpy array
+                        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+                        width = event.get("width", 0)
+                        height = event.get("height", 0)
+                        if width and height:
+                            image_array = image_array.reshape((height, width, 3))
+                            self.overlay_window.update_detection_data(image_array, zones)
+
             loot_count = event.get("loot_count")
             legendary_count = event.get("legendary_count")
             screenshot_path = event.get("screenshot")
@@ -976,19 +1566,29 @@ class BotWindow(QtWidgets.QMainWindow):
 
             extras = " | ".join(log_parts[1:]) if len(log_parts) > 1 else ""
 
-            if event_type == "error":
-                log_entry = f"[ERROR] {message}"
-                level = "error"
-            elif event_type == "legendary":
-                log_entry = f"[LEGENDARY] {message}"
-                if extras:
-                    log_entry += f" | {extras}"
-                level = "legendary"
-            else:
-                log_entry = " | ".join(filter(None, [message, extras]))
-                level = "info"
+            # Skip logging for certain debug events based on flags
+            should_log = True
+            if event_type == "detection":
+                # Only log detection events if show_confidence is enabled
+                should_log = bool(self.show_confidence.value)
+            elif event_type == "click":
+                # Only log click events if show_coords is enabled
+                should_log = bool(self.show_coords.value)
 
-            self._append_log(log_entry)
+            if should_log:
+                if event_type == "error":
+                    log_entry = f"[ERROR] {message}"
+                    level = "error"
+                elif event_type == "legendary":
+                    log_entry = f"[LEGENDARY] {message}"
+                    if extras:
+                        log_entry += f" | {extras}"
+                    level = "legendary"
+                else:
+                    log_entry = " | ".join(filter(None, [message, extras]))
+                    level = "info"
+
+                self._append_log(log_entry)
         else:
             text = str(event)
             self._append_log(text)
@@ -1124,6 +1724,26 @@ def _build_shared_state():
         "loot_opened": multiprocessing.Value("i", 0),
         "legendaries": multiprocessing.Value("i", 0),
         "screenshot_enabled": multiprocessing.Value("i", True),  # Default: enabled
+        # Template matching thresholds (0.0 to 1.0)
+        "threshold_open_loot": multiprocessing.Value("d", 0.40),
+        "threshold_loot_window": multiprocessing.Value("d", 0.35),
+        "threshold_hp_full": multiprocessing.Value("d", 0.85),
+        "threshold_hp_damaged": multiprocessing.Value("d", 0.95),
+        "threshold_hp_empty": multiprocessing.Value("d", 0.90),
+        # Debug options
+        "debug_mode": multiprocessing.Value("i", False),  # Save detection screenshots
+        "show_coords": multiprocessing.Value("i", False),  # Log click coordinates
+        "show_confidence": multiprocessing.Value("i", False),  # Log confidence scores
+        # Debug capture selection (which detections to save)
+        "debug_capture_open_loot": multiprocessing.Value("i", True),
+        "debug_capture_loot_window": multiprocessing.Value("i", True),
+        "debug_capture_hp_full": multiprocessing.Value("i", False),
+        "debug_capture_hp_damaged": multiprocessing.Value("i", False),
+        "debug_capture_hp_empty": multiprocessing.Value("i", False),
+        # Manual capture trigger (button press)
+        "manual_capture_trigger": multiprocessing.Value("i", 0),  # Increments each button press
+        # Detection overlay
+        "overlay_enabled": multiprocessing.Value("i", False),  # Whether to send overlay data
     }
 
 

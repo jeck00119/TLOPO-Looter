@@ -5,10 +5,11 @@ import win32ui
 
 
 class WindowCapture:
-    # Crop region definitions (x, y, width, height)
-    # IMPORTANT: Coordinates are for 1280x800 game window only
+    # Default crop region definitions (x, y, width, height)
+    # IMPORTANT: Base coordinates are for 1280x800 game window
     # (0,0) = top-left corner of game client area (inside window borders)
-    CROP_REGIONS = {
+    # These can be overridden with set_crop_regions() for different resolutions
+    DEFAULT_CROP_REGIONS = {
         "crop_boss_name": {"x": 570, "y": 70, "w": 200, "h": 25},
         "crop_enemy_hp": {"x": 571, "y": 93, "w": 225, "h": 18},
         "crop_hit_combo": {"x": 200, "y": 195, "w": 200, "h": 50},
@@ -26,6 +27,10 @@ class WindowCapture:
     offset_x = 0
     offset_y = 0
 
+    def __init__(self):
+        """Initialize with default crop regions"""
+        self.crop_regions = self.DEFAULT_CROP_REGIONS.copy()
+
     def __enter__(self):
         """Context manager entry - allows 'with' statement usage"""
         return self
@@ -34,6 +39,14 @@ class WindowCapture:
         """Context manager exit - cleanup resources if needed"""
         # Resources are cleaned up in get_screenshot, but this ensures proper context manager support
         return False  # Don't suppress exceptions
+
+    def set_crop_regions(self, scaled_regions):
+        """
+        Set custom crop regions for different resolutions.
+        Args:
+            scaled_regions: Dictionary of region definitions scaled to current resolution
+        """
+        self.crop_regions = scaled_regions
 
     def get_screenshot(self, window_name=None, crop=None):
         """
@@ -53,9 +66,9 @@ class WindowCapture:
         # get the window size
         window_rect = win32gui.GetWindowRect(self.hwnd)
 
-        # Use dictionary lookup for crop regions
-        if crop and crop in self.CROP_REGIONS:
-            region = self.CROP_REGIONS[crop]
+        # Use dictionary lookup for crop regions (uses scaled regions if set)
+        if crop and crop in self.crop_regions:
+            region = self.crop_regions[crop]
             self.w = region["w"]
             self.h = region["h"]
             self.cropped_x = region["x"]
