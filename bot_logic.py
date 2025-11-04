@@ -4,6 +4,7 @@ import numpy as np
 import os
 import pyttsx3
 import sys
+import threading
 import time
 import win32api as api
 import win32con
@@ -357,9 +358,15 @@ def scale_coordinates(scale_x, scale_y):
     }
 
 
-def scale_crop_regions(scale_x, scale_y):
+def scale_crop_regions(scale_x, scale_y, border_offset=(8, 31)):
     """
     Scale WindowCapture crop regions to current resolution.
+    Base coordinates include fixed borders, so we subtract border, scale client coords, then add border back.
+
+    Args:
+        scale_x, scale_y: Resolution scale factors
+        border_offset: (left_border, top_border) in pixels - fixed size, don't scale
+
     Returns: Dictionary of scaled region definitions
     """
     base_regions = {
@@ -371,11 +378,17 @@ def scale_crop_regions(scale_x, scale_y):
         "crop_test": {"x": 925, "y": 68, "w": 148, "h": 26},
     }
 
+    border_x, border_y = border_offset
     scaled_regions = {}
+
     for name, region in base_regions.items():
+        # Subtract border to get client coords, scale, then add border back
+        client_x = region['x'] - border_x
+        client_y = region['y'] - border_y
+
         scaled_regions[name] = {
-            'x': int(region['x'] * scale_x),
-            'y': int(region['y'] * scale_y),
+            'x': int(client_x * scale_x + border_x),
+            'y': int(client_y * scale_y + border_y),
             'w': int(region['w'] * scale_x),
             'h': int(region['h'] * scale_y)
         }
@@ -549,6 +562,182 @@ def has_message_overlay(frame):
         return False
 
 
+def overlay_update_thread(overlay_enabled, overlay_stop_event, status_queue, scaled_regions,
+                         threshold_open_loot, threshold_loot_window, threshold_hp_full,
+                         threshold_hp_damaged, scale_x, scale_y,
+                         template_open_loot, template_loot_window, template_hp_full,
+                         template_hp_damaged, border_offset, client_width, client_height):
+    """
+    Dedicated thread for overlay updates at 30+ FPS.
+    Runs independently of main bot loop to provide smooth real-time visualization.
+
+    Args:
+        border_offset: (left, top) offset to client area in pixels
+        client_width, client_height: Size of client area (game content without borders)
+    """
+    # Create separate WindowCapture and Vision instances for this thread
+    wincap_overlay = WindowCapture()
+
+    # Create crop region for client area (excludes borders/titlebar)
+    border_x, border_y = border_offset
+    client_area_region = {
+        'crop_client_area': {
+            'x': border_x,
+            'y': border_y,
+            'w': client_width,
+            'h': client_height
+        }
+    }
+    # Merge with scaled_regions
+    all_regions = {**scaled_regions, **client_area_region}
+    wincap_overlay.set_crop_regions(all_regions)
+
+    # Create vision objects with already-loaded templates
+    vision_open_loot = Vision(None)
+    vision_open_loot.needle_img = template_open_loot
+    vision_open_loot.needle_w = template_open_loot.shape[1]
+    vision_open_loot.needle_h = template_open_loot.shape[0]
+
+    vision_loot_window = Vision(None)
+    vision_loot_window.needle_img = template_loot_window
+    vision_loot_window.needle_w = template_loot_window.shape[1]
+    vision_loot_window.needle_h = template_loot_window.shape[0]
+
+    vision_enemy_hp_full = Vision(None)
+    vision_enemy_hp_full.needle_img = template_hp_full
+    vision_enemy_hp_full.needle_w = template_hp_full.shape[1]
+    vision_enemy_hp_full.needle_h = template_hp_full.shape[0]
+
+    vision_enemy_hp_damaged = Vision(None)
+    vision_enemy_hp_damaged.needle_img = template_hp_damaged
+    vision_enemy_hp_damaged.needle_w = template_hp_damaged.shape[1]
+    vision_enemy_hp_damaged.needle_h = template_hp_damaged.shape[0]
+
+    # Calculate threshold adjustment (same logic as main bot)
+    threshold_adjustment = 1.0
+    if scale_x < 1.0 or scale_y < 1.0:
+        min_scale = min(scale_x, scale_y)
+        threshold_adjustment = 0.85 + (min_scale * 0.15)
+
+    # Target 30 FPS = 33ms per frame
+    target_frame_time = 1.0 / 30.0
+
+    def send_overlay_data(image_bytes, width, height, zones):
+        """Helper to send overlay data to GUI"""
+        if status_queue:
+            event = {
+                "type": "detection_overlay",
+                "image": image_bytes,
+                "width": width,
+                "height": height,
+                "zones": zones
+            }
+            status_queue.put(event)
+
+    while not overlay_stop_event.is_set():
+        frame_start = time.time()
+
+        try:
+            # Only capture and send if overlay is enabled
+            if overlay_enabled and bool(overlay_enabled.value):
+                # Get current thresholds with adjustment
+                base_open_loot = float(threshold_open_loot.value) if threshold_open_loot else THRESHOLD_OPEN_LOOT
+                base_loot_window = float(threshold_loot_window.value) if threshold_loot_window else THRESHOLD_LOOT_WINDOW
+                base_hp_full = float(threshold_hp_full.value) if threshold_hp_full else THRESHOLD_HP_FULL
+                base_hp_damaged = float(threshold_hp_damaged.value) if threshold_hp_damaged else THRESHOLD_HP_DAMAGED
+
+                # Apply threshold adjustment
+                current_thresholds = {
+                    'OPEN_LOOT': base_open_loot * threshold_adjustment,
+                    'LOOT_WINDOW': base_loot_window * threshold_adjustment,
+                    'HP_FULL': base_hp_full * threshold_adjustment,
+                    'HP_DAMAGED': base_hp_damaged * threshold_adjustment,
+                }
+
+                # Capture client area only (excludes borders/titlebar)
+                client_area = wincap_overlay.get_screenshot(GAME_WINDOW_TITLE, crop='crop_client_area')
+
+                if client_area is not None:
+                    # Get region definitions (coordinates are already relative to client area)
+                    ol_region = scaled_regions['crop_open_loot']
+                    lw_region = scaled_regions['crop_loot_window']
+                    hp_region = scaled_regions['crop_enemy_hp']
+
+                    # Convert coordinates to be relative to client area (subtract border offset)
+                    ol_x = ol_region['x'] - border_x
+                    ol_y = ol_region['y'] - border_y
+                    lw_x = lw_region['x'] - border_x
+                    lw_y = lw_region['y'] - border_y
+                    hp_x = hp_region['x'] - border_x
+                    hp_y = hp_region['y'] - border_y
+
+                    # Crop zones from client area
+                    open_loot_crop = client_area[
+                        ol_y:ol_y + ol_region['h'],
+                        ol_x:ol_x + ol_region['w']
+                    ]
+                    loot_window_crop = client_area[
+                        lw_y:lw_y + lw_region['h'],
+                        lw_x:lw_x + lw_region['w']
+                    ]
+                    enemy_hp_crop = client_area[
+                        hp_y:hp_y + hp_region['h'],
+                        hp_x:hp_x + hp_region['w']
+                    ]
+
+                    # Perform detections
+                    fresh_open_loot = vision_open_loot.find(open_loot_crop, current_thresholds['OPEN_LOOT'])
+                    fresh_loot_window = vision_loot_window.find(loot_window_crop, current_thresholds['LOOT_WINDOW'])
+                    fresh_hp_full = vision_enemy_hp_full.find(enemy_hp_crop, current_thresholds['HP_FULL'])
+                    fresh_hp_damaged = vision_enemy_hp_damaged.find(enemy_hp_crop, current_thresholds['HP_DAMAGED'])
+
+                    # Build zones dictionary (use client-relative coordinates)
+                    # Use base dimensions for overlay display (game UI doesn't scale proportionally)
+                    zones = {
+                        'Open Loot': {
+                            'x': ol_x,
+                            'y': ol_y,
+                            'w': 155,  # Base dimension
+                            'h': 34,   # Base dimension
+                            'detected': fresh_open_loot.any()
+                        },
+                        'Loot Window': {
+                            'x': lw_x,
+                            'y': lw_y,
+                            'w': 397,  # Base dimension
+                            'h': 262,  # Base dimension
+                            'detected': fresh_loot_window.any()
+                        },
+                        'Enemy HP (Full)': {
+                            'x': hp_x,
+                            'y': hp_y,
+                            'w': 225,  # Base dimension
+                            'h': 18,   # Base dimension
+                            'detected': fresh_hp_full.any()
+                        },
+                        'Enemy HP (Damaged)': {
+                            'x': hp_x,
+                            'y': hp_y,
+                            'w': 225,  # Base dimension
+                            'h': 18,   # Base dimension
+                            'detected': fresh_hp_damaged.any()
+                        }
+                    }
+
+                    # Send overlay data (client area only)
+                    image_bytes = client_area.tobytes()
+                    send_overlay_data(image_bytes, client_area.shape[1], client_area.shape[0], zones)
+
+        except Exception as e:
+            # Silently continue on errors to avoid spam
+            pass
+
+        # Maintain target frame rate
+        frame_time = time.time() - frame_start
+        sleep_time = max(0, target_frame_time - frame_time)
+        time.sleep(sleep_time)
+
+
 def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, loot_opened, legendaries, status_queue=None, screenshot_enabled=None,
             threshold_open_loot=None, threshold_loot_window=None, threshold_hp_full=None, threshold_hp_damaged=None, threshold_hp_empty=None,
             debug_mode=None, show_coords=None, show_confidence=None,
@@ -577,6 +766,19 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
             if label:
                 msg += f" - {label}"
             notify("click", msg, x=x, y=y)
+
+        # Send click to overlay for visualization
+        # Color code by type
+        if "Take Small Items" in label or "Take" in label:
+            color = (0, 255, 0)  # Green for take items
+        elif "Trash" in label:
+            color = (255, 165, 0)  # Orange for trash
+        elif "Legendary" in label:
+            color = (255, 0, 255)  # Magenta for legendary
+        else:
+            color = (255, 255, 0)  # Yellow for other clicks
+
+        notify("overlay_click", x=x, y=y, label=label or "Click", color=color)
 
     def game_closed():
         started.value = False
@@ -755,11 +957,16 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
     notify("status", "🔍 Detecting game resolution...")
     current_w, current_h, scale_x, scale_y = detect_resolution_and_scale(handle)
     notify("status", f"📐 Resolution: {current_w}x{current_h} | Scale: {scale_x:.2f}x, {scale_y:.2f}x")
-    # Send resolution info to GUI for debug display
-    notify("resolution_detected", resolution=f"{current_w}x{current_h}", scale_x=scale_x, scale_y=scale_y)
+
+    # Detect window border offset (fixed pixels, don't scale)
+    border_offset = wincap.get_client_offset(GAME_WINDOW_TITLE)
+    notify("status", f"🖼️ Window border offset: {border_offset[0]}px (left), {border_offset[1]}px (top)")
+
+    # Send resolution info to GUI for debug display (including border offset)
+    notify("resolution_detected", resolution=f"{current_w}x{current_h}", scale_x=scale_x, scale_y=scale_y, border_offset=border_offset)
 
     # Scale crop regions and set them on WindowCapture
-    scaled_regions = scale_crop_regions(scale_x, scale_y)
+    scaled_regions = scale_crop_regions(scale_x, scale_y, border_offset)
     wincap.set_crop_regions(scaled_regions)
     notify("status", "✅ Crop regions scaled to current resolution")
 
@@ -798,6 +1005,10 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
         'HP_DAMAGED': base_threshold_hp_damaged * threshold_adjustment,
         'HP_EMPTY': base_threshold_hp_empty * threshold_adjustment,
     }
+
+    # Initialize overlay thread variables
+    overlay_stop_event = None
+    overlay_thread = None
 
     # Load and scale templates
     try:
@@ -850,6 +1061,22 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
         vision_loot = Vision(None)
 
         notify("status", "✅ All templates loaded and ready")
+
+        # Start overlay update thread (30+ FPS) - after templates are loaded
+        if overlay_enabled:
+            overlay_stop_event = threading.Event()
+            overlay_thread = threading.Thread(
+                target=overlay_update_thread,
+                args=(overlay_enabled, overlay_stop_event, status_queue, scaled_regions,
+                      threshold_open_loot, threshold_loot_window, threshold_hp_full,
+                      threshold_hp_damaged, scale_x, scale_y,
+                      template_open_loot, template_loot_window, template_hp_full,
+                      template_hp_damaged, border_offset, current_w, current_h),
+                daemon=True
+            )
+            overlay_thread.start()
+            notify("status", "✅ Overlay thread started (30 FPS)")
+
     except Exception as e:
         notify("error", f"❌ Failed to load template images: {e}")
         started.value = False
@@ -1016,6 +1243,8 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
                         sleep(TAKE_ITEMS_DELAY)
                     else:
                         notify("status", "✅ All items collected, loot window closed.")
+                        # Clear click visualizations after loot cycle completes
+                        notify("overlay_clear_clicks")
 
                 enemy_hp_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_enemy_hp')
                 rectangles_enemy_hp_full = vision_enemy_hp_full.find(enemy_hp_frame, current_thresholds['HP_FULL'])
@@ -1075,63 +1304,6 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
                         press_ctrl()
                         sleep(attack_delay.value)
 
-                # Send detection overlay data to GUI (if enabled)
-                if overlay_enabled and bool(overlay_enabled.value):
-                    try:
-                        # Capture full game window
-                        full_window = wincap.get_screenshot(GAME_WINDOW_TITLE)
-
-                        if full_window is not None:
-                            # Build zones dictionary with detection results
-                            zones = {
-                                'Open Loot': {
-                                    'x': scaled_regions['crop_open_loot']['x'],
-                                    'y': scaled_regions['crop_open_loot']['y'],
-                                    'w': scaled_regions['crop_open_loot']['w'],
-                                    'h': scaled_regions['crop_open_loot']['h'],
-                                    'detected': rectangles_open_loot.any()
-                                },
-                                'Loot Window': {
-                                    'x': scaled_regions['crop_loot_window']['x'],
-                                    'y': scaled_regions['crop_loot_window']['y'],
-                                    'w': scaled_regions['crop_loot_window']['w'],
-                                    'h': scaled_regions['crop_loot_window']['h'],
-                                    'detected': rectangles_loot_window.any()
-                                },
-                                'Enemy HP (Full)': {
-                                    'x': scaled_regions['crop_enemy_hp']['x'],
-                                    'y': scaled_regions['crop_enemy_hp']['y'],
-                                    'w': scaled_regions['crop_enemy_hp']['w'],
-                                    'h': scaled_regions['crop_enemy_hp']['h'],
-                                    'detected': rectangles_enemy_hp_full.any()
-                                },
-                                'Enemy HP (Damaged)': {
-                                    'x': scaled_regions['crop_enemy_hp']['x'],
-                                    'y': scaled_regions['crop_enemy_hp']['y'],
-                                    'w': scaled_regions['crop_enemy_hp']['w'],
-                                    'h': scaled_regions['crop_enemy_hp']['h'],
-                                    'detected': rectangles_enemy_hp_damaged.any()
-                                },
-                                'Enemy HP (Empty)': {
-                                    'x': scaled_regions['crop_enemy_hp']['x'],
-                                    'y': scaled_regions['crop_enemy_hp']['y'],
-                                    'w': scaled_regions['crop_enemy_hp']['w'],
-                                    'h': scaled_regions['crop_enemy_hp']['h'],
-                                    'detected': rectangles_enemy_hp_empty.any()
-                                }
-                            }
-
-                            # Serialize image and send to GUI
-                            image_bytes = full_window.tobytes()
-                            notify("detection_overlay",
-                                   image=image_bytes,
-                                   width=full_window.shape[1],
-                                   height=full_window.shape[0],
-                                   zones=zones)
-                    except Exception as overlay_error:
-                        # Don't crash bot if overlay fails
-                        notify("error", f"⚠️ Overlay update failed: {overlay_error}")
-
             except Exception as e:
                 notify("error", f"❌ Bot loop error: {e}")
                 continue
@@ -1142,3 +1314,9 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
         if cv2.waitKey(1) == ord('q'):
             cv2.destroyAllWindows()
             break
+
+    # Clean up overlay thread
+    if overlay_enabled and overlay_thread:
+        overlay_stop_event.set()
+        overlay_thread.join(timeout=1.0)
+        notify("status", "✅ Overlay thread stopped")

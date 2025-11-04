@@ -137,3 +137,25 @@ class WindowCapture:
     # the __init__ constructor.
     def get_screen_position(self, pos):
         return (pos[0] + self.offset_x, pos[1] + self.offset_y)
+
+    def get_client_offset(self, window_name):
+        """
+        Calculate the offset between window rect and client rect.
+        Window borders/titlebar are fixed pixel sizes that don't scale with resolution.
+        Returns: (offset_x, offset_y) - pixels to add to client coords to get window coords
+        """
+        hwnd = win32gui.FindWindow(None, window_name)
+        if not hwnd:
+            return (0, 0)
+
+        # Get window rect (includes borders and title bar)
+        window_rect = win32gui.GetWindowRect(hwnd)
+
+        # Get client area top-left in screen coordinates
+        client_to_screen = win32gui.ClientToScreen(hwnd, (0, 0))
+
+        # Calculate border offset (fixed pixel size regardless of resolution)
+        offset_x = client_to_screen[0] - window_rect[0]  # Left border width
+        offset_y = client_to_screen[1] - window_rect[1]  # Top border (titlebar) height
+
+        return (offset_x, offset_y)

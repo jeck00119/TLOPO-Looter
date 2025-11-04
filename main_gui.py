@@ -225,28 +225,235 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
     Green rectangles = detection found
     Red rectangles = no detection
     """
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("TLOPO Looter - Detection Overlay")
+    def __init__(self, parent=None, log_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("TLOPO Looter - Detection Overlay [Position: 0, 0]")
         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
 
         # Store latest detection data
         self.game_image = None
-        self.detection_zones = {}  # {zone_name: {'rect': (x, y, w, h), 'detected': bool}}
+        self.detection_zones = {}  # {zone_name: {'x': x, 'y': y, 'w': w, 'h': h, 'detected': bool}}
+        self.zone_offsets = {}  # {zone_name: {'dx': 0, 'dy': 0}} - manual adjustments
+
+        # Click visualization
+        self.click_positions = []  # List of {'x': x, 'y': y, 'label': label, 'color': (r,g,b)}
+
+        # Position tracking
+        self.offset_x = 0
+        self.offset_y = 0
+        self.log_callback = log_callback
+
+        # Dragging state
+        self.dragging_zone = None
+        self.drag_start_pos = None
+        self.drag_start_zone_pos = None
+
+        # Resolution info (set externally)
+        self.resolution = "Unknown"
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self.border_offset = (0, 0)
 
         # Create display label
         self.image_label = QtWidgets.QLabel()
         self.image_label.setAlignment(QtCore.Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: #000000;")
+        self.image_label.setMouseTracking(True)
+
+        # Info label at top for instructions
+        self.info_label = QtWidgets.QLabel("Drag zones | P: save | R: reset | C: clear clicks")
+        self.info_label.setStyleSheet("background-color: #222222; color: #00FF00; padding: 5px; font-weight: bold;")
+        self.info_label.setAlignment(QtCore.Qt.AlignCenter)
 
         # Layout
         layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(self.info_label)
         layout.addWidget(self.image_label)
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
         # Initial size
         self.resize(800, 600)
+
+    def set_resolution_info(self, resolution, scale_x, scale_y, border_offset):
+        """Set resolution info for debugging"""
+        self.resolution = resolution
+        self.scale_x = scale_x
+        self.scale_y = scale_y
+        self.border_offset = border_offset
+
+    def reset_offsets(self):
+        """Reset all manual zone offsets to default"""
+        self.zone_offsets = {}
+        if self.log_callback:
+            self.log_callback("🔄 Overlay zones reset to default positions")
+        # Redraw with reset positions
+        if self.game_image is not None and self.detection_zones:
+            self.update_detection_data(self.game_image, self.detection_zones)
+
+    def add_click(self, x, y, label="Click", color=(255, 255, 0)):
+        """Add a click position to visualize"""
+        self.click_positions.append({'x': x, 'y': y, 'label': label, 'color': color})
+
+    def clear_clicks(self):
+        """Clear all click visualizations"""
+        self.click_positions = []
+        if self.log_callback:
+            self.log_callback("🧹 Cleared click visualizations")
+
+    def mousePressEvent(self, event):
+        """Start dragging a zone"""
+        if event.button() == QtCore.Qt.LeftButton:
+            # Check if click is inside any zone
+            click_pos = event.pos()
+            # Account for info label height
+            click_y = click_pos.y() - self.info_label.height()
+
+            for zone_name, zone_data in self.detection_zones.items():
+                offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
+                x = zone_data.get('x', 0) + offset['dx']
+                y = zone_data.get('y', 0) + offset['dy']
+                w = zone_data.get('w', 0)
+                h = zone_data.get('h', 0)
+
+                if x <= click_pos.x() <= x + w and y <= click_y <= y + h:
+                    self.dragging_zone = zone_name
+                    self.drag_start_pos = click_pos
+                    self.drag_start_zone_pos = (x, y)
+                    self.setCursor(QtCore.Qt.ClosedHandCursor)
+                    break
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Update zone position while dragging"""
+        if self.dragging_zone and self.drag_start_pos:
+            delta_x = event.pos().x() - self.drag_start_pos.x()
+            delta_y = event.pos().y() - self.drag_start_pos.y()
+
+            # Update zone offset
+            if self.dragging_zone not in self.zone_offsets:
+                self.zone_offsets[self.dragging_zone] = {'dx': 0, 'dy': 0}
+
+            original_x = self.detection_zones[self.dragging_zone].get('x', 0)
+            original_y = self.detection_zones[self.dragging_zone].get('y', 0)
+            new_x = self.drag_start_zone_pos[0] + delta_x
+            new_y = self.drag_start_zone_pos[1] + delta_y
+
+            self.zone_offsets[self.dragging_zone]['dx'] = new_x - original_x
+            self.zone_offsets[self.dragging_zone]['dy'] = new_y - original_y
+
+            # Redraw
+            self.update_detection_data(self.game_image, self.detection_zones)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Stop dragging"""
+        if event.button() == QtCore.Qt.LeftButton:
+            self.dragging_zone = None
+            self.drag_start_pos = None
+            self.drag_start_zone_pos = None
+            self.setCursor(QtCore.Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts"""
+        if event.key() == QtCore.Qt.Key_P:
+            # Save all debug info to file
+            self._save_debug_file()
+        elif event.key() == QtCore.Qt.Key_R:
+            # Reset all zone offsets to default
+            self.reset_offsets()
+        elif event.key() == QtCore.Qt.Key_C:
+            # Clear click visualizations
+            self.clear_clicks()
+        super().keyPressEvent(event)
+
+    def _save_debug_file(self):
+        """Save zone positions and debug info to file"""
+        from datetime import datetime
+        import os
+
+        if not self.detection_zones:
+            if self.log_callback:
+                self.log_callback("❌ No detection zones data available yet")
+            return
+
+        # Create filename with resolution
+        resolution_safe = self.resolution.replace('x', '_')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"overlay_debug_{resolution_safe}_{timestamp}.txt"
+
+        # Build debug content
+        lines = []
+        lines.append("=" * 70)
+        lines.append(f"TLOPO Looter - Detection Overlay Debug Report")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 70)
+        lines.append("")
+        lines.append("RESOLUTION INFO:")
+        lines.append(f"  Game Resolution: {self.resolution}")
+        lines.append(f"  Scale Factors: X={self.scale_x:.4f}, Y={self.scale_y:.4f}")
+        lines.append(f"  Border Offset: X={self.border_offset[0]}px, Y={self.border_offset[1]}px")
+        lines.append(f"  Overlay Window Position: X={self.offset_x}, Y={self.offset_y}")
+        lines.append("")
+        lines.append("DETECTION ZONES:")
+        lines.append("-" * 70)
+
+        for zone_name, zone_data in self.detection_zones.items():
+            original_x = zone_data.get('x', 0)
+            original_y = zone_data.get('y', 0)
+            w = zone_data.get('w', 0)
+            h = zone_data.get('h', 0)
+            detected = zone_data.get('detected', False)
+
+            offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
+            adjusted_x = original_x + offset['dx']
+            adjusted_y = original_y + offset['dy']
+
+            status = "DETECTED" if detected else "NOT FOUND"
+
+            lines.append(f"\n{zone_name}:")
+            lines.append(f"  Original Position: x={original_x}, y={original_y}")
+            lines.append(f"  Adjusted Position: x={adjusted_x}, y={adjusted_y}")
+            lines.append(f"  Manual Offset: dx={offset['dx']}, dy={offset['dy']}")
+            lines.append(f"  Size: w={w}, h={h}")
+            lines.append(f"  Status: {status}")
+
+        lines.append("")
+        lines.append("=" * 70)
+        lines.append("NOTES:")
+        lines.append("  - Original Position: Calculated by bot based on resolution scaling")
+        lines.append("  - Adjusted Position: After manual dragging in overlay window")
+        lines.append("  - Manual Offset: Difference between original and adjusted")
+        lines.append("=" * 70)
+
+        # Save to file
+        try:
+            with open(filename, 'w') as f:
+                f.write('\n'.join(lines))
+
+            if self.log_callback:
+                self.log_callback(f"✅ Debug info saved to: {filename}")
+                self.log_callback(f"📍 Window Position: X={self.offset_x}, Y={self.offset_y}")
+                for zone_name in self.detection_zones.keys():
+                    offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
+                    if offset['dx'] != 0 or offset['dy'] != 0:
+                        self.log_callback(f"  {zone_name}: Offset dx={offset['dx']}, dy={offset['dy']}")
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"❌ Error saving debug file: {e}")
+
+    def moveEvent(self, event):
+        """Track position changes and update title"""
+        super().moveEvent(event)
+        pos = self.pos()
+        self.offset_x = pos.x()
+        self.offset_y = pos.y()
+        self.setWindowTitle(f"TLOPO Looter - Detection Overlay [Position: {self.offset_x}, {self.offset_y}]")
+
+    def get_offset(self):
+        """Get current window offset"""
+        return (self.offset_x, self.offset_y)
 
     def update_detection_data(self, game_image, zones):
         """
@@ -261,22 +468,32 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
         if game_image is None:
             return
 
+        # Store zones for position logging
+        self.detection_zones = zones
+
         # Create a copy to draw on
         overlay_image = game_image.copy()
 
         # Draw rectangles for each detection zone
         for zone_name, zone_data in zones.items():
+            # Get original position
             x = zone_data.get('x', 0)
             y = zone_data.get('y', 0)
             w = zone_data.get('w', 0)
             h = zone_data.get('h', 0)
             detected = zone_data.get('detected', False)
 
+            # Apply manual offset if dragged
+            offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
+            x += offset['dx']
+            y += offset['dy']
+
             # Choose color: Green if detected, Red if not
             color = (0, 255, 0) if detected else (0, 0, 255)  # BGR format
 
-            # Draw rectangle
-            cv2.rectangle(overlay_image, (x, y), (x + w, y + h), color, 2)
+            # Draw rectangle (thicker if manually adjusted)
+            thickness = 3 if (offset['dx'] != 0 or offset['dy'] != 0) else 2
+            cv2.rectangle(overlay_image, (x, y), (x + w, y + h), color, thickness)
 
             # Draw label with background
             label = f"{zone_name}: {'DETECTED' if detected else 'NOT FOUND'}"
@@ -291,6 +508,30 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
             # Draw text
             text_color = (255, 255, 255)  # White text
             cv2.putText(overlay_image, label, (x + 5, y - 5), font, font_scale, text_color, thickness)
+
+        # Draw click visualizations
+        for click in self.click_positions:
+            click_x = click['x']
+            click_y = click['y']
+            click_label = click['label']
+            click_color = click['color']  # RGB format, need to convert to BGR
+
+            # Convert RGB to BGR for OpenCV
+            bgr_color = (click_color[2], click_color[1], click_color[0])
+
+            # Draw filled circle for click position
+            cv2.circle(overlay_image, (click_x, click_y), 8, bgr_color, -1)
+            # Draw outline
+            cv2.circle(overlay_image, (click_x, click_y), 8, (255, 255, 255), 2)
+
+            # Draw small label next to click
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.4
+            thickness = 1
+            text_offset_x = click_x + 12
+            text_offset_y = click_y + 5
+            cv2.putText(overlay_image, click_label, (text_offset_x, text_offset_y),
+                       font, font_scale, (255, 255, 255), thickness)
 
         # Convert BGR to RGB for Qt
         rgb_image = cv2.cvtColor(overlay_image, cv2.COLOR_BGR2RGB)
@@ -349,6 +590,12 @@ class BotWindow(QtWidgets.QMainWindow):
 
         # Detection overlay window
         self.overlay_window = None
+
+        # Resolution tracking for overlay debugging
+        self.current_resolution = "Unknown"
+        self.current_scale_x = 1.0
+        self.current_scale_y = 1.0
+        self.current_border_offset = (0, 0)
 
         self._init_window()
         self._build_ui()
@@ -1349,10 +1596,18 @@ class BotWindow(QtWidgets.QMainWindow):
                 self.overlay_enabled.value = True
 
             # Create and show overlay window
+            self._append_log("📍 TIP: Drag zones to adjust positions. Press 'P' to save debug file.")
             if self.overlay_window is None:
-                self.overlay_window = DetectionOverlayWindow()
+                self.overlay_window = DetectionOverlayWindow(log_callback=self._append_log)
+                # Set resolution info if available
+                self.overlay_window.set_resolution_info(
+                    self.current_resolution,
+                    self.current_scale_x,
+                    self.current_scale_y,
+                    self.current_border_offset
+                )
             self.overlay_window.show()
-            self._append_log("✅ Detection overlay window opened. Green = detected, Red = not detected.")
+            self._append_log("✅ Detection overlay opened. Drag zones, press 'P' to save positions.")
         else:
             # Disable overlay data sending
             with self.overlay_enabled.get_lock():
@@ -1505,6 +1760,23 @@ class BotWindow(QtWidgets.QMainWindow):
                 resolution = event.get("resolution")
                 scale_x = event.get("scale_x")
                 scale_y = event.get("scale_y")
+                border_offset = event.get("border_offset", (0, 0))
+
+                # Store for overlay window
+                self.current_resolution = resolution
+                self.current_scale_x = scale_x if scale_x is not None else 1.0
+                self.current_scale_y = scale_y if scale_y is not None else 1.0
+                self.current_border_offset = border_offset
+
+                # Update overlay window if it exists
+                if self.overlay_window:
+                    self.overlay_window.set_resolution_info(
+                        resolution or "Unknown",
+                        self.current_scale_x,
+                        self.current_scale_y,
+                        border_offset
+                    )
+
                 if resolution:
                     self.debug_resolution_label.setText(resolution)
                 if scale_x is not None and scale_y is not None:
@@ -1524,6 +1796,21 @@ class BotWindow(QtWidgets.QMainWindow):
                 y = event.get("y")
                 if x is not None and y is not None:
                     self.debug_last_click_label.setText(f"({x}, {y})")
+
+            # Handle overlay click visualization
+            if event_type == "overlay_click":
+                if self.overlay_window:
+                    x = event.get("x")
+                    y = event.get("y")
+                    label = event.get("label", "Click")
+                    color = event.get("color", (255, 255, 0))  # Default yellow
+                    if x is not None and y is not None:
+                        self.overlay_window.add_click(x, y, label, color)
+
+            # Handle overlay click clearing
+            if event_type == "overlay_clear_clicks":
+                if self.overlay_window:
+                    self.overlay_window.clear_clicks()
 
             # Handle detection overlay updates
             if event_type == "detection_overlay":
@@ -1628,6 +1915,11 @@ class BotWindow(QtWidgets.QMainWindow):
         speak_async("Bot Stopped")
         note = "Bot stopped." if manual else "Bot process ended."
         self._append_log(note)
+
+        # Reset overlay zones to default positions
+        if self.overlay_window:
+            self.overlay_window.reset_offsets()
+
         self._drain_status_queue()
         self._update_status_labels()
 

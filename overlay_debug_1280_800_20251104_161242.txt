@@ -1,0 +1,48 @@
+======================================================================
+TLOPO Looter - Detection Overlay Debug Report
+Generated: 2025-11-04 16:12:42
+======================================================================
+
+RESOLUTION INFO:
+  Game Resolution: 1280x800
+  Scale Factors: X=1.0000, Y=1.0000
+  Border Offset: X=8px, Y=31px
+  Overlay Window Position: X=1228, Y=302
+
+DETECTION ZONES:
+----------------------------------------------------------------------
+
+Open Loot:
+  Original Position: x=570, y=684
+  Adjusted Position: x=570, y=684
+  Manual Offset: dx=0, dy=0
+  Size: w=155, h=34
+  Status: NOT FOUND
+
+Loot Window:
+  Original Position: x=207, y=209
+  Adjusted Position: x=207, y=209
+  Manual Offset: dx=0, dy=0
+  Size: w=397, h=262
+  Status: NOT FOUND
+
+Enemy HP (Full):
+  Original Position: x=571, y=93
+  Adjusted Position: x=571, y=93
+  Manual Offset: dx=0, dy=0
+  Size: w=225, h=18
+  Status: DETECTED
+
+Enemy HP (Damaged):
+  Original Position: x=571, y=93
+  Adjusted Position: x=571, y=93
+  Manual Offset: dx=0, dy=0
+  Size: w=225, h=18
+  Status: NOT FOUND
+
+======================================================================
+NOTES:
+  - Original Position: Calculated by bot based on resolution scaling
+  - Adjusted Position: After manual dragging in overlay window
+  - Manual Offset: Difference between original and adjusted
+======================================================================
