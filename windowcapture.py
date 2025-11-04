@@ -110,14 +110,36 @@ class WindowCapture:
 
         finally:
             # Always free resources, even if an exception occurs
-            if dcObj is not None:
-                dcObj.DeleteDC()
+            # IMPORTANT: Cleanup order matters - delete child resources before parent
+            # Wrap each in try-except to prevent cascading failures
+
+            # 1. Delete compatible DC first (child) - this auto-deselects the bitmap
             if cDC is not None:
-                cDC.DeleteDC()
+                try:
+                    cDC.DeleteDC()
+                except Exception:
+                    pass  # Silently continue cleanup even if this fails
+
+            # 2. Delete parent DC object
+            if dcObj is not None:
+                try:
+                    dcObj.DeleteDC()
+                except Exception:
+                    pass
+
+            # 3. Release window DC
             if wDC is not None and self.hwnd is not None:
-                win32gui.ReleaseDC(self.hwnd, wDC)
+                try:
+                    win32gui.ReleaseDC(self.hwnd, wDC)
+                except Exception:
+                    pass
+
+            # 4. Delete bitmap object last
             if dataBitMap is not None:
-                win32gui.DeleteObject(dataBitMap.GetHandle())
+                try:
+                    win32gui.DeleteObject(dataBitMap.GetHandle())
+                except Exception:
+                    pass
 
     # find the name of the window you're interested in.
     # once you have it, update window_capture()

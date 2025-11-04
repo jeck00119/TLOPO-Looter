@@ -1,7 +1,10 @@
 import cv2 as cv2
+import ctypes
+from ctypes import wintypes
 import hashlib
 import numpy as np
 import os
+import psutil
 import pyttsx3
 import sys
 import threading
@@ -9,6 +12,7 @@ import time
 import win32api as api
 import win32con
 import win32gui as gui
+import winreg
 from datetime import datetime
 from time import sleep
 from win32con import WM_KEYDOWN, WM_KEYUP, VK_CONTROL, WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON, VK_SHIFT
@@ -26,6 +30,18 @@ from windowcapture import WindowCapture
 GAME_WINDOW_TITLE = "The Legend of Pirates Online [BETA]"
 GAME_RESOLUTION = (1280, 800)
 WINDOW_BORDER_OFFSET = (16, 39)  # (width, height) borders
+
+# Data Storage Paths
+SCREENSHOT_BASE_PATH = 'Data\\All Loot Screenshots'
+
+# Resolution Modes (shared with GUI)
+RESOLUTION_MODE_ADAPTIVE = 0
+RESOLUTION_MODE_FORCED = 1
+DEFAULT_RESOLUTION_MODE = RESOLUTION_MODE_ADAPTIVE
+RESOLUTION_MODE_LABELS = {
+    RESOLUTION_MODE_ADAPTIVE: "Scaled (auto-detect)",
+    RESOLUTION_MODE_FORCED: "Force 1280x800",
+}
 
 # Timing Delays (seconds)
 LOOP_DELAY = 0.3
@@ -106,21 +122,28 @@ def ensure_data_directories(session_folder=None):
     """
     Create data directories. If session_folder is provided, creates session-based structure.
     Otherwise creates legacy flat structure.
+    Returns: (success, error_message) - False if any directory creation failed
     """
     if session_folder:
         # Session-based structure
         targets = [
-            get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot'),
-            get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Regular Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\Legendary Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\Regular Loot'),
         ]
     else:
         # Legacy flat structure (backward compatibility)
         targets = [
-            get_data_path('Data\\All Loot Screenshots\\Legendary Loot'),
-            get_data_path('Data\\All Loot Screenshots\\Regular Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\Legendary Loot'),
+            get_data_path(f'{SCREENSHOT_BASE_PATH}\\Regular Loot'),
         ]
+
+    # Use centralized utility for consistency and error reporting
     for target in targets:
-        os.makedirs(target, exist_ok=True)
+        success, error = ensure_directory_exists(target)
+        if not success:
+            return (False, f"Failed to create directory {target}: {error}")
+
+    return (True, None)
 
 
 def ensure_directory_exists(path):
@@ -152,51 +175,42 @@ def get_screenshot_path(session_folder, filename, legendary=False, fallback=Fals
         filename = f"{base}_FALLBACK{ext}"
 
     subfolder = 'Legendary Loot' if legendary else 'Regular Loot'
-    return get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\{subfolder}\\{filename}')
+    return get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\{subfolder}\\{filename}')
 
 
 def get_info_path(session_folder, filename):
     """Construct path for legendary info text file"""
-    return get_data_path(f'Data\\All Loot Screenshots\\{session_folder}\\Legendary Loot\\{filename}')
+    return get_data_path(f'{SCREENSHOT_BASE_PATH}\\{session_folder}\\Legendary Loot\\{filename}')
 
 
 def save_debug_screenshot(frame, template, region_name, timestamp, threshold):
     """
     Save debug screenshot showing what's being matched.
-    Saves both the captured region and the scaled template for comparison.
-    Args:
-        frame: The screenshot region being searched
-        template: The scaled template being matched
-        region_name: Name of the detection (e.g., 'open_loot', 'loot_window')
-        timestamp: Timestamp string for filename
-        threshold: Threshold value used for detection
+    Stores captured region, template, and metadata for later review.
     """
     try:
         debug_folder = get_data_path('Data\\Debug')
         os.makedirs(debug_folder, exist_ok=True)
 
-        # Save the captured region
         region_path = os.path.join(debug_folder, f'{timestamp}_{region_name}_region.jpg')
-        cv2.imwrite(region_path, frame)
-
-        # Save the template being matched
         template_path = os.path.join(debug_folder, f'{timestamp}_{region_name}_template.jpg')
+        info_path = os.path.join(debug_folder, f'{timestamp}_{region_name}_info.txt')
+
+        cv2.imwrite(region_path, frame)
         cv2.imwrite(template_path, template)
 
-        # Save a text file with info
-        info_path = os.path.join(debug_folder, f'{timestamp}_{region_name}_info.txt')
-        with open(info_path, 'w') as f:
-            f.write(f"Detection: {region_name}\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Threshold: {threshold:.2f}\n")
-            f.write(f"Region size: {frame.shape[1]}x{frame.shape[0]}\n")
-            f.write(f"Template size: {template.shape[1]}x{template.shape[0]}\n")
-            f.write(f"\nFiles saved:\n")
-            f.write(f"  Region: {region_path}\n")
-            f.write(f"  Template: {template_path}\n")
+        with open(info_path, 'w', encoding='utf-8') as info_file:
+            info_file.write(f"Detection: {region_name}\n")
+            info_file.write(f"Timestamp: {timestamp}\n")
+            info_file.write(f"Threshold: {threshold:.2f}\n")
+            info_file.write(f"Region size: {frame.shape[1]}x{frame.shape[0]}\n")
+            info_file.write(f"Template size: {template.shape[1]}x{template.shape[0]}\n")
+            info_file.write("\nFiles saved:\n")
+            info_file.write(f"  Region: {region_path}\n")
+            info_file.write(f"  Template: {template_path}\n")
 
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
@@ -216,23 +230,53 @@ img_dir = resource_path("img")
 # WINDOW UTILITY FUNCTIONS
 # ===========================
 
-def check_window():
+def check_window(force_base_resolution=False):
     """
-    Checks if game window exists and restores if minimized.
+    Checks if game window exists and optionally auto-corrects size.
     Returns window handle if found, 0 if not found.
 
-    Note: Bot now adapts to any resolution, so no auto-resize is performed.
+    During startup validation: Called from subprocess (no PyQt5 interference).
+    During bot operation: Called from bot process (no PyQt5 interference).
+    Both contexts are safe for resize.
     """
     try:
         handle = gui.FindWindow(None, GAME_WINDOW_TITLE)
         if not handle:
             return 0
 
-        # Restore if minimized (CRITICAL: Bot can't capture minimized windows)
+        # Restore if minimized
         left, top, right, bottom = gui.GetClientRect(handle)
         if right == 0 and bottom == 0:
             gui.ShowWindow(handle, win32con.SW_SHOWNORMAL)
             sleep(0.1)  # Give window time to restore
+
+        if force_base_resolution:
+            # Auto-correct window size if it's wrong (e.g., user resized it)
+            # Only do quick correction (1 iteration) to not slow down bot
+            client_rect = gui.GetClientRect(handle)
+            current_w = client_rect[2]
+            current_h = client_rect[3]
+
+            # Check if size is significantly wrong (>10px off)
+            error_w = abs(GAME_RESOLUTION[0] - current_w)
+            error_h = abs(GAME_RESOLUTION[1] - current_h)
+
+            if error_w > 10 or error_h > 10:
+                # Size is wrong, do quick correction
+                x0, y0, x1, y1 = gui.GetWindowRect(handle)
+                window_w = x1 - x0
+                window_h = y1 - y0
+
+                # Calculate correction
+                correction_w = GAME_RESOLUTION[0] - current_w
+                correction_h = GAME_RESOLUTION[1] - current_h
+
+                # Apply correction
+                new_w = window_w + correction_w
+                new_h = window_h + correction_h
+
+                gui.MoveWindow(handle, x0, y0, new_w, new_h, True)
+                sleep(0.1)
 
         return handle
 
@@ -242,12 +286,10 @@ def check_window():
 
 def resize_window_iterative(handle, max_iterations=3):
     """
-    DEPRECATED: This function is kept for backward compatibility with window_fix_tool.py only.
+    Resize window using iterative error correction.
+    Returns True if successful (within 10px tolerance), False otherwise.
 
-    Bot no longer forces window resizing - it adapts to any resolution.
-    This function tries to resize window to 1280x800 for diagnostic purposes only.
-
-    Returns True if successful (within ±10px tolerance), False otherwise.
+    This is the method that worked in window_fix_tool.py testing.
     """
     try:
         TOLERANCE = 10
@@ -295,41 +337,10 @@ def resize_window_iterative(handle, max_iterations=3):
         return False
 
 
-def check_dpi_settings(hwnd):
-    """
-    DEPRECATED: This function is kept for backward compatibility with window_fix_tool.py.
-
-    Returns informational message about current resolution.
-    Bot now adapts to any resolution, so this never blocks startup.
-
-    Returns: (always_true, info_message)
-    """
-    try:
-        # Get actual client area dimensions
-        client_rect = gui.GetClientRect(hwnd)
-        actual_width = client_rect[2]
-        actual_height = client_rect[3]
-
-        # Just return informational message (never blocks)
-        return (True, f"Detected resolution: {actual_width}x{actual_height} (bot will auto-scale)")
-
-    except Exception as e:
-        return (True, f"Resolution detection skipped: {e}")
-
-
-# ===========================
-# END WINDOW UTILITIES
-# ===========================
-
-
-# ===========================
-# RESOLUTION SCALING SYSTEM
-# ===========================
-
 def detect_resolution_and_scale(hwnd):
     """
     Detect current game resolution and calculate scale factors.
-    Base resolution: 1280x800
+    Base resolution: 1280x800.
     Returns: (current_width, current_height, scale_x, scale_y)
     """
     try:
@@ -337,52 +348,36 @@ def detect_resolution_and_scale(hwnd):
         current_w = rect[2]
         current_h = rect[3]
 
-        # Calculate scale factors relative to base resolution
-        scale_x = current_w / 1280.0
-        scale_y = current_h / 800.0
+        if current_w == 0 or current_h == 0:
+            return GAME_RESOLUTION[0], GAME_RESOLUTION[1], 1.0, 1.0
 
+        scale_x = current_w / float(GAME_RESOLUTION[0])
+        scale_y = current_h / float(GAME_RESOLUTION[1])
         return current_w, current_h, scale_x, scale_y
-    except Exception as e:
-        # Fallback to base resolution if detection fails
-        return 1280, 800, 1.0, 1.0
+    except Exception:
+        return GAME_RESOLUTION[0], GAME_RESOLUTION[1], 1.0, 1.0
 
 
 def scale_coordinates(scale_x, scale_y):
     """
-    Scale all hardcoded button coordinates to current resolution.
-    Returns: Dictionary of scaled coordinate tuples
+    Scale hardcoded button coordinates to current resolution.
+    Returns: dictionary with scaled coordinate tuples.
     """
     return {
-        'TAKE_SMALL_ITEMS_BUTTON': (int(532 * scale_x), int(399 * scale_y)),
-        'TRASH_BUTTON': (int(221 * scale_x), int(205 * scale_y)),
+        'TAKE_SMALL_ITEMS_BUTTON': (int(TAKE_SMALL_ITEMS_BUTTON[0] * scale_x), int(TAKE_SMALL_ITEMS_BUTTON[1] * scale_y)),
+        'TRASH_BUTTON': (int(TRASH_BUTTON[0] * scale_x), int(TRASH_BUTTON[1] * scale_y)),
     }
 
 
-def scale_crop_regions(scale_x, scale_y, border_offset=(8, 31)):
+def scale_crop_regions(scale_x, scale_y, border_offset):
     """
     Scale WindowCapture crop regions to current resolution.
-    Base coordinates include fixed borders, so we subtract border, scale client coords, then add border back.
-
-    Args:
-        scale_x, scale_y: Resolution scale factors
-        border_offset: (left_border, top_border) in pixels - fixed size, don't scale
-
-    Returns: Dictionary of scaled region definitions
+    Base coordinates include fixed borders, so subtract border, scale client coords, then add border back.
     """
-    base_regions = {
-        "crop_boss_name": {"x": 570, "y": 70, "w": 200, "h": 25},
-        "crop_enemy_hp": {"x": 571, "y": 93, "w": 225, "h": 18},
-        "crop_hit_combo": {"x": 200, "y": 195, "w": 200, "h": 50},
-        "crop_loot_window": {"x": 207, "y": 209, "w": 397, "h": 262},
-        "crop_open_loot": {"x": 570, "y": 684, "w": 155, "h": 34},
-        "crop_test": {"x": 925, "y": 68, "w": 148, "h": 26},
-    }
-
     border_x, border_y = border_offset
     scaled_regions = {}
 
-    for name, region in base_regions.items():
-        # Subtract border to get client coords, scale, then add border back
+    for name, region in WindowCapture.DEFAULT_CROP_REGIONS.items():
         client_x = region['x'] - border_x
         client_y = region['y'] - border_y
 
@@ -390,24 +385,21 @@ def scale_crop_regions(scale_x, scale_y, border_offset=(8, 31)):
             'x': int(client_x * scale_x + border_x),
             'y': int(client_y * scale_y + border_y),
             'w': int(region['w'] * scale_x),
-            'h': int(region['h'] * scale_y)
+            'h': int(region['h'] * scale_y),
         }
 
     return scaled_regions
 
 
 def scale_legendary_detection(scale_x, scale_y):
-    """
-    Scale legendary item detection parameters to current resolution.
-    Returns: Dictionary of scaled detection parameters
-    """
+    """Scale legendary item detection parameters to current resolution."""
     return {
-        'OFFSET_X': int(176 * scale_x),  # LEGENDARY_OFFSET_X
-        'OFFSET_Y': int(189 * scale_y),  # LEGENDARY_OFFSET_Y
-        'RANGE_1_START': int(250 * scale_x),
-        'RANGE_1_END': int(280 * scale_x),
-        'RANGE_2_START': int(404 * scale_x),
-        'RANGE_2_END': int(437 * scale_x),
+        'OFFSET_X': int(LEGENDARY_OFFSET_X * scale_x),
+        'OFFSET_Y': int(LEGENDARY_OFFSET_Y * scale_y),
+        'RANGE_1_START': int(min(LEGENDARY_RANGE_1) * scale_x),
+        'RANGE_1_END': int(max(LEGENDARY_RANGE_1) * scale_x),
+        'RANGE_2_START': int(min(LEGENDARY_RANGE_2) * scale_x),
+        'RANGE_2_END': int(max(LEGENDARY_RANGE_2) * scale_x),
     }
 
 
@@ -415,58 +407,300 @@ def scale_template(template_img, scale_x, scale_y):
     """
     Scale a template image to match current resolution.
     Uses INTER_AREA for downscaling (better quality), INTER_CUBIC for upscaling.
-    Returns: Scaled template image
+    Returns: scaled template image.
     """
+    if template_img is None:
+        return None
+
     if scale_x == 1.0 and scale_y == 1.0:
-        return template_img  # No scaling needed
+        return template_img
 
-    # Choose interpolation based on scaling direction
-    # INTER_AREA is best for downscaling (reduces aliasing/blur)
-    # INTER_CUBIC is best for upscaling (smoother)
     if scale_x < 1.0 or scale_y < 1.0:
-        interpolation = cv2.INTER_AREA  # Downscaling
+        interpolation = cv2.INTER_AREA
     else:
-        interpolation = cv2.INTER_CUBIC  # Upscaling
+        interpolation = cv2.INTER_CUBIC
 
-    return cv2.resize(template_img, None, fx=scale_x, fy=scale_y,
-                     interpolation=interpolation)
+    return cv2.resize(template_img, None, fx=scale_x, fy=scale_y, interpolation=interpolation)
+
+
+def get_window_border_offset():
+    """Return border offsets using WindowCapture helper."""
+    try:
+        wincap = WindowCapture()
+        return wincap.get_client_offset(GAME_WINDOW_TITLE)
+    except Exception:
+        return WINDOW_BORDER_OFFSET
+
+
+def check_dpi_settings(hwnd):
+    """
+    Check if window dimensions are correct (indicates proper DPI settings).
+    Accepts dimensions within 10 pixels tolerance to account for window borders
+    and minor DPI quirks. Requires DPI override set to "System" in game properties.
+    Returns: (is_correct, error_message)
+    """
+    try:
+        # Get actual client area dimensions
+        client_rect = gui.GetClientRect(hwnd)
+        actual_width = client_rect[2]
+        actual_height = client_rect[3]
+        expected_width, expected_height = GAME_RESOLUTION  # (1280, 800)
+
+        # Calculate pixel difference
+        width_diff = abs(actual_width - expected_width)
+        height_diff = abs(actual_height - expected_height)
+
+        # Allow 10 pixels tolerance for window borders and DPI quirks
+        TOLERANCE = 10
+
+        # If dimensions are exact or within tolerance
+        if actual_width == expected_width and actual_height == expected_height:
+            return (True, f"Resolution OK: Client area is {actual_width}x{actual_height}")
+        elif width_diff <= TOLERANCE and height_diff <= TOLERANCE:
+            # Close enough - show warning but don't block
+            return (True,
+                   f"Resolution OK (within tolerance): Client area is {actual_width}x{actual_height}, "
+                   f"expected {expected_width}x{expected_height}. "
+                   f"Difference: {width_diff}x{height_diff} pixels (tolerance: {TOLERANCE}px)")
+        else:
+            # Too far off - block startup
+            return (False,
+                   f"Window dimensions incorrect. Client area is {actual_width}x{actual_height}, "
+                   f"expected {expected_width}x{expected_height} ({TOLERANCE}px tolerance).\n\n"
+                   f"Troubleshooting:\n"
+                   f"1. Set game to 1280x800 resolution in-game graphics settings\n"
+                   f"2. Make sure game is in windowed mode (not fullscreen)\n"
+                   f"3. Restart the bot to trigger auto-resize\n\n"
+                   f"Note: Bot attempts automatic resize but Windows display scaling\n"
+                   f"at {actual_width}x{actual_height} suggests game is DPI-unaware.\n"
+                   f"Try setting game .exe compatibility: 'Override high DPI scaling' = 'System'")
+
+    except Exception as e:
+        # If check fails, don't block startup - log warning instead
+        return (True, f"Resolution check skipped: {e}")
+
+
+def check_dpi_registry_setting(hwnd):
+    """
+    Check if game executable has DPI override set in Windows registry.
+    Returns: (status, exe_path, registry_value, message)
+    Status: "correct", "incorrect", "not_set", "error"
+    """
+    try:
+        # Get process ID from window handle
+        process_id = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+
+        # Get executable path using psutil
+        try:
+            process = psutil.Process(process_id.value)
+            exe_path = process.exe()
+        except:
+            return ("error", None, None, "Could not get process executable path")
+
+        # Check registry for DPI override setting
+        try:
+            reg_key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
+                0,
+                winreg.KEY_READ
+            )
+
+            try:
+                value, reg_type = winreg.QueryValueEx(reg_key, exe_path)
+                winreg.CloseKey(reg_key)
+
+                # Check what type of DPI override is set
+                # System = "~ DPIUNAWARE" (with space)
+                # Application = "~ HIGHDPIAWARE"
+                # System (Enhanced) = "~ GDIDPISCALING DPIUNAWARE"
+
+                if "~ DPIUNAWARE" in value and "GDIDPISCALING" not in value:
+                    return ("correct", exe_path, value, "DPI Override set to 'System' (correct)")
+                elif "~ HIGHDPIAWARE" in value:
+                    return ("incorrect", exe_path, value, "DPI Override set to 'Application' (should be 'System')")
+                elif "~ GDIDPISCALING DPIUNAWARE" in value:
+                    return ("incorrect", exe_path, value, "DPI Override set to 'System (Enhanced)' (should be 'System')")
+                else:
+                    return ("incorrect", exe_path, value, f"Unknown DPI Override: {value}")
+
+            except FileNotFoundError:
+                winreg.CloseKey(reg_key)
+                return ("not_set", exe_path, None, "No DPI Override set in registry")
+
+        except FileNotFoundError:
+            return ("not_set", exe_path, None, "Registry key does not exist")
+
+    except Exception as e:
+        return ("error", None, None, f"Error checking registry: {e}")
+
+
+def set_dpi_override_to_system(exe_path):
+    """
+    Automatically set DPI override to 'System' in Windows registry.
+
+    Args:
+        exe_path: Full path to executable
+
+    Returns: (success, message)
+    """
+    try:
+        # Registry key path
+        key_path = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
+        # Try to open existing key or create if it doesn't exist
+        try:
+            reg_key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                key_path,
+                0,
+                winreg.KEY_WRITE
+            )
+        except FileNotFoundError:
+            # Key doesn't exist, create it
+            reg_key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path)
+
+        # Set the DPI override value
+        # "~ DPIUNAWARE" = System (note the space after ~)
+        winreg.SetValueEx(reg_key, exe_path, 0, winreg.REG_SZ, "~ DPIUNAWARE")
+        winreg.CloseKey(reg_key)
+
+        return (True, "Successfully set DPI override to 'System'")
+
+    except PermissionError:
+        return (False, "Permission denied. Try running as administrator.")
+    except Exception as e:
+        return (False, f"Failed to set registry value: {e}")
+
+
+def handle_dpi_configuration(hwnd):
+    """
+    Handle DPI configuration workflow: check status and apply fix if needed.
+
+    This function centralizes the DPI configuration logic that was previously
+    split between bot_logic.py and main_gui.py.
+
+    Args:
+        hwnd: Window handle
+
+    Returns: dict with keys:
+        - success: bool - Whether DPI is correctly configured (after fix if applied)
+        - action: str - "already_correct", "fixed", "failed", "error"
+        - exe_path: str - Executable path
+        - message: str - User-friendly message
+        - restart_required: bool - Whether game needs restart
+    """
+    result = {
+        'success': False,
+        'action': 'error',
+        'exe_path': None,
+        'message': '',
+        'restart_required': False
+    }
+
+    try:
+        # Check current DPI status
+        status, exe_path, reg_value, status_message = check_dpi_registry_setting(hwnd)
+        result['exe_path'] = exe_path
+
+        if status == "error":
+            result['message'] = status_message
+            return result
+
+        if status == "correct":
+            result['success'] = True
+            result['action'] = 'already_correct'
+            result['message'] = "DPI override already correctly configured"
+            return result
+
+        # DPI needs fixing (status is "not_set" or "incorrect")
+        if not exe_path:
+            result['message'] = "Could not determine executable path"
+            return result
+
+        # Attempt to apply fix
+        fix_success, fix_message = set_dpi_override_to_system(exe_path)
+
+        if fix_success:
+            result['success'] = True
+            result['action'] = 'fixed'
+            result['message'] = fix_message
+            result['restart_required'] = True
+        else:
+            result['action'] = 'failed'
+            result['message'] = fix_message
+
+        return result
+
+    except Exception as e:
+        result['message'] = f"Error handling DPI configuration: {e}"
+        return result
 
 
 # ===========================
-# END RESOLUTION SCALING
+# END WINDOW UTILITIES
 # ===========================
 
 
-def validate_game_ready():
+def validate_game_ready(resolution_mode=DEFAULT_RESOLUTION_MODE):
     """
     Validate all requirements before starting bot.
-    Now resolution-independent - accepts any game resolution.
     Returns: (success, error_message, details)
     """
-    details = {}
+    details = {
+        'resolution_mode': resolution_mode,
+    }
 
-    # Check 1: Game window exists and is not minimized
-    handle = check_window()
+    force_base_resolution = resolution_mode == RESOLUTION_MODE_FORCED
+
+    # Check 1: Game window exists
+    handle = check_window(force_base_resolution=force_base_resolution)
     if not handle:
         return (False, "Game window not detected. Please start the game.", details)
     details['window_handle'] = handle
 
-    # Check 2: Detect current resolution (no enforcement, just log)
-    try:
+    current_w, current_h, scale_x, scale_y = detect_resolution_and_scale(handle)
+    details['detected_resolution'] = f"{current_w}x{current_h}"
+    details['client_size'] = f"{current_w}x{current_h}"
+
+    if force_base_resolution:
+        details['initial_size'] = f"{current_w}x{current_h}"
+        resize_success = resize_window_iterative(handle, max_iterations=5)
+        details['resize_attempted'] = True
+        details['resize_success'] = resize_success
+        sleep(0.2)
+
+        dpi_correct, dpi_msg = check_dpi_settings(handle)
+        details['dpi_message'] = dpi_msg
+        if not dpi_correct:
+            final_rect = gui.GetClientRect(handle)
+            final_w = final_rect[2]
+            final_h = final_rect[3]
+            details['final_size'] = f"{final_w}x{final_h}"
+
+            enhanced_msg = f"{dpi_msg}\n\nDiagnostics:\n"
+            enhanced_msg += f"  Initial size: {current_w}x{current_h}\n"
+            enhanced_msg += f"  After resize: {final_w}x{final_h}\n"
+            enhanced_msg += f"  Target: {GAME_RESOLUTION[0]}x{GAME_RESOLUTION[1]}"
+            return (False, enhanced_msg, details)
+
+        # Refresh resolution info after resize (should now match 1280x800)
         current_w, current_h, scale_x, scale_y = detect_resolution_and_scale(handle)
-        details['detected_resolution'] = f"{current_w}x{current_h}"
-        details['scale_factors'] = f"{scale_x:.2f}x, {scale_y:.2f}x"
-        details['resolution_ok'] = True
+        details['post_resize_resolution'] = f"{current_w}x{current_h}"
+        scale_x = 1.0
+        scale_y = 1.0
+    else:
+        details['resize_attempted'] = False
+        details['dpi_message'] = "Adaptive scaling enabled"
 
-        # Informational message (not blocking)
-        if current_w == 1280 and current_h == 800:
-            details['resolution_note'] = "Using base resolution (no scaling needed)"
-        else:
-            details['resolution_note'] = f"Bot will scale for {current_w}x{current_h} resolution"
-    except Exception as e:
-        return (False, f"Failed to detect game resolution: {e}", details)
+    details['scale_factors'] = f"{scale_x:.2f}x, {scale_y:.2f}x"
+    details['scale_x'] = scale_x
+    details['scale_y'] = scale_y
+    details['resolution_ok'] = True
+    details['border_offset'] = get_window_border_offset()
 
-    # Check 3: Template images exist
+    # Check 4: Template images exist
     img_dir = resource_path("img")
     required_templates = [
         'open_loot.jpg',
@@ -488,7 +722,7 @@ def validate_game_ready():
 
     details['templates_ok'] = True
 
-    # Check 4: Data folder writable
+    # Check 5: Data folder writable
     try:
         test_dir = get_data_path('Data')
         os.makedirs(test_dir, exist_ok=True)
@@ -501,6 +735,29 @@ def validate_game_ready():
         details['data_folder_writable'] = True
     except Exception as e:
         return (False, f"Cannot write to Data/ folder. Check permissions. Error: {e}", details)
+
+    # Check 6: DPI override configured correctly
+    dpi_status, exe_path, dpi_value, dpi_message = check_dpi_registry_setting(handle)
+    details['dpi_status'] = dpi_status
+    details['dpi_exe_path'] = exe_path
+    details['dpi_registry_value'] = dpi_value
+
+    if dpi_status == "error":
+        # Error checking DPI - don't block, but warn
+        details['dpi_warning'] = dpi_message
+    elif dpi_status in ["not_set", "incorrect"]:
+        # DPI override missing or wrong - offer to fix automatically
+        error_msg = f"DPI Override Configuration Issue\n\n"
+        error_msg += f"Game: {exe_path}\n"
+        error_msg += f"Status: {dpi_message}\n\n"
+        error_msg += f"The bot can automatically fix this for you.\n\n"
+        error_msg += f"Would you like to apply the fix?\n"
+        error_msg += f"(After fixing, you MUST restart the game for changes to take effect)"
+
+        # Return special status for GUI to handle with Yes/No dialog
+        return (False, error_msg, details)
+
+    details['dpi_ok'] = True
 
     # All checks passed
     return (True, "All validation checks passed", details)
@@ -563,22 +820,16 @@ def has_message_overlay(frame):
 
 
 def overlay_update_thread(overlay_enabled, overlay_stop_event, status_queue, scaled_regions,
-                         threshold_open_loot, threshold_loot_window, threshold_hp_full,
-                         threshold_hp_damaged, scale_x, scale_y,
-                         template_open_loot, template_loot_window, template_hp_full,
-                         template_hp_damaged, border_offset, client_width, client_height):
+                          threshold_open_loot, threshold_loot_window, threshold_hp_full,
+                          threshold_hp_damaged, scale_x, scale_y,
+                          template_open_loot, template_loot_window, template_hp_full,
+                          template_hp_damaged, border_offset, client_width, client_height):
     """
-    Dedicated thread for overlay updates at 30+ FPS.
-    Runs independently of main bot loop to provide smooth real-time visualization.
-
-    Args:
-        border_offset: (left, top) offset to client area in pixels
-        client_width, client_height: Size of client area (game content without borders)
+    Dedicated thread for overlay updates (aim for ~30 FPS).
+    Provides smooth real-time visualization without blocking main bot loop.
     """
-    # Create separate WindowCapture and Vision instances for this thread
     wincap_overlay = WindowCapture()
 
-    # Create crop region for client area (excludes borders/titlebar)
     border_x, border_y = border_offset
     client_area_region = {
         'crop_client_area': {
@@ -588,11 +839,11 @@ def overlay_update_thread(overlay_enabled, overlay_stop_event, status_queue, sca
             'h': client_height
         }
     }
-    # Merge with scaled_regions
+
     all_regions = {**scaled_regions, **client_area_region}
     wincap_overlay.set_crop_regions(all_regions)
 
-    # Create vision objects with already-loaded templates
+    # Vision objects with pre-scaled templates
     vision_open_loot = Vision(None)
     vision_open_loot.needle_img = template_open_loot
     vision_open_loot.needle_w = template_open_loot.shape[1]
@@ -613,136 +864,164 @@ def overlay_update_thread(overlay_enabled, overlay_stop_event, status_queue, sca
     vision_enemy_hp_damaged.needle_w = template_hp_damaged.shape[1]
     vision_enemy_hp_damaged.needle_h = template_hp_damaged.shape[0]
 
-    # Calculate threshold adjustment (same logic as main bot)
+    template_requirements = {
+        'crop_open_loot': (template_open_loot.shape[1], template_open_loot.shape[0]),
+        'crop_loot_window': (template_loot_window.shape[1], template_loot_window.shape[0]),
+        'crop_enemy_hp': (template_hp_full.shape[1], template_hp_full.shape[0]),
+    }
+
     threshold_adjustment = 1.0
     if scale_x < 1.0 or scale_y < 1.0:
         min_scale = min(scale_x, scale_y)
         threshold_adjustment = 0.85 + (min_scale * 0.15)
 
-    # Target 30 FPS = 33ms per frame
     target_frame_time = 1.0 / 30.0
-
-    def send_overlay_data(image_bytes, width, height, zones):
-        """Helper to send overlay data to GUI"""
-        if status_queue:
-            event = {
-                "type": "detection_overlay",
-                "image": image_bytes,
-                "width": width,
-                "height": height,
-                "zones": zones
-            }
-            status_queue.put(event)
+    invalid_zone_reported = set()
 
     while not overlay_stop_event.is_set():
         frame_start = time.time()
 
         try:
-            # Only capture and send if overlay is enabled
-            if overlay_enabled and bool(overlay_enabled.value):
-                # Get current thresholds with adjustment
-                base_open_loot = float(threshold_open_loot.value) if threshold_open_loot else THRESHOLD_OPEN_LOOT
-                base_loot_window = float(threshold_loot_window.value) if threshold_loot_window else THRESHOLD_LOOT_WINDOW
-                base_hp_full = float(threshold_hp_full.value) if threshold_hp_full else THRESHOLD_HP_FULL
-                base_hp_damaged = float(threshold_hp_damaged.value) if threshold_hp_damaged else THRESHOLD_HP_DAMAGED
+            if not overlay_enabled or not bool(overlay_enabled.value):
+                time.sleep(0.1)
+                continue
 
-                # Apply threshold adjustment
-                current_thresholds = {
-                    'OPEN_LOOT': base_open_loot * threshold_adjustment,
-                    'LOOT_WINDOW': base_loot_window * threshold_adjustment,
-                    'HP_FULL': base_hp_full * threshold_adjustment,
-                    'HP_DAMAGED': base_hp_damaged * threshold_adjustment,
-                }
+            client_area = wincap_overlay.get_screenshot(GAME_WINDOW_TITLE, crop='crop_client_area')
+            if client_area is None:
+                time.sleep(0.1)
+                continue
 
-                # Capture client area only (excludes borders/titlebar)
-                client_area = wincap_overlay.get_screenshot(GAME_WINDOW_TITLE, crop='crop_client_area')
+            base_open_loot = float(threshold_open_loot.value) if threshold_open_loot else THRESHOLD_OPEN_LOOT
+            base_loot_window = float(threshold_loot_window.value) if threshold_loot_window else THRESHOLD_LOOT_WINDOW
+            base_hp_full = float(threshold_hp_full.value) if threshold_hp_full else THRESHOLD_HP_FULL
+            base_hp_damaged = float(threshold_hp_damaged.value) if threshold_hp_damaged else THRESHOLD_HP_DAMAGED
 
-                if client_area is not None:
-                    # Get region definitions (coordinates are already relative to client area)
-                    ol_region = scaled_regions['crop_open_loot']
-                    lw_region = scaled_regions['crop_loot_window']
-                    hp_region = scaled_regions['crop_enemy_hp']
+            current_thresholds = {
+                'OPEN_LOOT': base_open_loot * threshold_adjustment,
+                'LOOT_WINDOW': base_loot_window * threshold_adjustment,
+                'HP_FULL': base_hp_full * threshold_adjustment,
+                'HP_DAMAGED': base_hp_damaged * threshold_adjustment,
+            }
 
-                    # Convert coordinates to be relative to client area (subtract border offset)
-                    ol_x = ol_region['x'] - border_x
-                    ol_y = ol_region['y'] - border_y
-                    lw_x = lw_region['x'] - border_x
-                    lw_y = lw_region['y'] - border_y
-                    hp_x = hp_region['x'] - border_x
-                    hp_y = hp_region['y'] - border_y
+            zones = []
 
-                    # Crop zones from client area
-                    open_loot_crop = client_area[
-                        ol_y:ol_y + ol_region['h'],
-                        ol_x:ol_x + ol_region['w']
+            def evaluate_zone(region_key, vision_obj, threshold_key):
+                region = scaled_regions.get(region_key)
+                if not region:
+                    return
+                template_w, template_h = template_requirements.get(region_key, (1, 1))
+                valid_size = region['w'] >= template_w and region['h'] >= template_h
+                rectangles = None
+
+                if valid_size:
+                    crop = client_area[
+                        (region['y'] - border_y):(region['y'] - border_y) + region['h'],
+                        (region['x'] - border_x):(region['x'] - border_x) + region['w']
                     ]
-                    loot_window_crop = client_area[
-                        lw_y:lw_y + lw_region['h'],
-                        lw_x:lw_x + lw_region['w']
-                    ]
-                    enemy_hp_crop = client_area[
-                        hp_y:hp_y + hp_region['h'],
-                        hp_x:hp_x + hp_region['w']
-                    ]
+                    try:
+                        rectangles = vision_obj.find(crop, current_thresholds[threshold_key])
+                        invalid_zone_reported.discard(region_key)
+                    except cv2.error as cv_err:
+                        rectangles = None
+                        valid_size = False
+                        if status_queue and region_key not in invalid_zone_reported:
+                            status_queue.put({
+                                "type": "overlay_error",
+                                "message": (
+                                    f"Overlay zone '{region_key}' caused OpenCV error: {cv_err}. "
+                                    f"Reset or enlarge the zone in the overlay window."
+                                ),
+                            })
+                        invalid_zone_reported.add(region_key)
+                else:
+                    crop = None
+                    if status_queue and region_key not in invalid_zone_reported:
+                        status_queue.put({
+                            "type": "overlay_error",
+                            "message": (
+                                f"Overlay zone '{region_key}' is smaller than its template size "
+                                f"({region['w']}x{region['h']} vs >= {template_w}x{template_h}); "
+                                "increase the zone in the overlay window."
+                            ),
+                        })
+                    invalid_zone_reported.add(region_key)
 
-                    # Perform detections
-                    fresh_open_loot = vision_open_loot.find(open_loot_crop, current_thresholds['OPEN_LOOT'])
-                    fresh_loot_window = vision_loot_window.find(loot_window_crop, current_thresholds['LOOT_WINDOW'])
-                    fresh_hp_full = vision_enemy_hp_full.find(enemy_hp_crop, current_thresholds['HP_FULL'])
-                    fresh_hp_damaged = vision_enemy_hp_damaged.find(enemy_hp_crop, current_thresholds['HP_DAMAGED'])
+                rel_x = region['x'] - border_x
+                rel_y = region['y'] - border_y
+                detected = bool(rectangles.any()) if rectangles is not None else False
+                zones.append({
+                    'name': region_key,
+                    'x': rel_x,
+                    'y': rel_y,
+                    'w': region['w'],
+                    'h': region['h'],
+                    'detected': detected,
+                    'min_w': template_w,
+                    'min_h': template_h,
+                    'valid': valid_size,
+                })
 
-                    # Build zones dictionary (use client-relative coordinates)
-                    # Use base dimensions for overlay display (game UI doesn't scale proportionally)
-                    zones = {
-                        'Open Loot': {
-                            'x': ol_x,
-                            'y': ol_y,
-                            'w': 155,  # Base dimension
-                            'h': 34,   # Base dimension
-                            'detected': fresh_open_loot.any()
-                        },
-                        'Loot Window': {
-                            'x': lw_x,
-                            'y': lw_y,
-                            'w': 397,  # Base dimension
-                            'h': 262,  # Base dimension
-                            'detected': fresh_loot_window.any()
-                        },
-                        'Enemy HP (Full)': {
-                            'x': hp_x,
-                            'y': hp_y,
-                            'w': 225,  # Base dimension
-                            'h': 18,   # Base dimension
-                            'detected': fresh_hp_full.any()
-                        },
-                        'Enemy HP (Damaged)': {
-                            'x': hp_x,
-                            'y': hp_y,
-                            'w': 225,  # Base dimension
-                            'h': 18,   # Base dimension
-                            'detected': fresh_hp_damaged.any()
-                        }
-                    }
+            evaluate_zone('crop_open_loot', vision_open_loot, 'OPEN_LOOT')
+            evaluate_zone('crop_loot_window', vision_loot_window, 'LOOT_WINDOW')
+            evaluate_zone('crop_enemy_hp', vision_enemy_hp_full, 'HP_FULL')
 
-                    # Send overlay data (client area only)
-                    image_bytes = client_area.tobytes()
-                    send_overlay_data(image_bytes, client_area.shape[1], client_area.shape[0], zones)
+            image_bytes = client_area.tobytes()
+            if status_queue:
+                status_queue.put({
+                    "type": "detection_overlay",
+                    "image": image_bytes,
+                    "width": client_area.shape[1],
+                    "height": client_area.shape[0],
+                    "zones": zones,
+                    "resolution": f"{client_width}x{client_height}",
+                    "scale_x": scale_x,
+                    "scale_y": scale_y,
+                    "border_offset": border_offset,
+                })
 
-        except Exception as e:
-            # Silently continue on errors to avoid spam
-            pass
+        except Exception as overlay_error:
+            if status_queue:
+                status_queue.put({
+                    "type": "overlay_error",
+                    "message": f"Overlay thread error: {overlay_error}",
+                })
+            time.sleep(0.2)
 
-        # Maintain target frame rate
-        frame_time = time.time() - frame_start
-        sleep_time = max(0, target_frame_time - frame_time)
-        time.sleep(sleep_time)
+        frame_duration = time.time() - frame_start
+        sleep_time = target_frame_time - frame_duration
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
-
-def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, loot_opened, legendaries, status_queue=None, screenshot_enabled=None,
-            threshold_open_loot=None, threshold_loot_window=None, threshold_hp_full=None, threshold_hp_damaged=None, threshold_hp_empty=None,
-            debug_mode=None, show_coords=None, show_confidence=None,
-            debug_capture_open_loot=None, debug_capture_loot_window=None, debug_capture_hp_full=None, debug_capture_hp_damaged=None, debug_capture_hp_empty=None,
-            manual_capture_trigger=None, overlay_enabled=None):
+def run_bot(
+    started,
+    attack_delay,
+    wait_after_enemy_spawn,
+    gui_settings_opened,
+    loot_opened,
+    legendaries,
+    status_queue=None,
+    screenshot_enabled=None,
+    resolution_mode=None,
+    threshold_open_loot=None,
+    threshold_loot_window=None,
+    threshold_hp_full=None,
+    threshold_hp_damaged=None,
+    threshold_hp_empty=None,
+    debug_mode=None,
+    show_coords=None,
+    show_confidence=None,
+    debug_capture_open_loot=None,
+    debug_capture_loot_window=None,
+    debug_capture_hp_full=None,
+    debug_capture_hp_damaged=None,
+    debug_capture_hp_empty=None,
+    manual_capture_trigger=None,
+    overlay_enabled=None,
+    disable_bot_actions=None,
+    use_overlay_zones_flag=None,
+    overlay_zones_dict=None,
+    session_folder=None,
+):
     """Main bot loop extracted from the CLI script."""
 
     def notify(event_type, message=None, **payload):
@@ -758,565 +1037,583 @@ def run_bot(started, attack_delay, wait_after_enemy_spawn, gui_settings_opened, 
         except Exception:
             pass
 
+    def get_bool(value):
+        try:
+            return bool(value.value)
+        except Exception:
+            return False
+
+    def get_float(value, default):
+        try:
+            return float(value.value)
+        except Exception:
+            return default
+
+    def actions_enabled():
+        """Check if bot actions are enabled (returns True if actions should execute)"""
+        if disable_bot_actions is None:
+            return True
+        try:
+            return not bool(disable_bot_actions.value)
+        except Exception:
+            return True
+
     def click_with_logging(x, y, label=""):
-        """Wrapper for press_left_click that logs coordinates if enabled"""
-        press_left_click(x, y)
-        if show_coords and bool(show_coords.value):
-            msg = f"🖱️ Clicked at ({x}, {y})"
+        if actions_enabled():
+            press_left_click(x, y)
+        else:
+            notify("status", f"[DRY RUN] Would click at ({x}, {y}) ({label})")
+        if get_bool(show_coords):
+            msg = f"Click at ({x}, {y})"
             if label:
                 msg += f" - {label}"
             notify("click", msg, x=x, y=y)
+        if overlay_enabled:
+            color = (255, 255, 0)
+            if label:
+                lowered = label.lower()
+                if "take" in lowered:
+                    color = (0, 255, 0)
+                elif "trash" in lowered:
+                    color = (255, 165, 0)
+                elif "legendary" in lowered:
+                    color = (255, 0, 255)
+            notify("overlay_click", x=x, y=y, label=label or "Click", color=color)
 
-        # Send click to overlay for visualization
-        # Color code by type
-        if "Take Small Items" in label or "Take" in label:
-            color = (0, 255, 0)  # Green for take items
-        elif "Trash" in label:
-            color = (255, 165, 0)  # Orange for trash
-        elif "Legendary" in label:
-            color = (255, 0, 255)  # Magenta for legendary
-        else:
-            color = (255, 255, 0)  # Yellow for other clicks
+    def capture_debug(region_name, frame, template, threshold):
+        if not get_bool(debug_mode):
+            return
+        flag_map = {
+            "open_loot": debug_capture_open_loot,
+            "loot_window": debug_capture_loot_window,
+            "hp_full": debug_capture_hp_full,
+            "hp_damaged": debug_capture_hp_damaged,
+            "hp_empty": debug_capture_hp_empty,
+        }
+        flag = flag_map.get(region_name)
+        if flag is not None and not get_bool(flag):
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_debug_screenshot(frame, template, region_name, timestamp, threshold)
 
-        notify("overlay_click", x=x, y=y, label=label or "Click", color=color)
+    start_time = datetime.now()
+    if session_folder is None:
+        session_folder = start_time.strftime("Session_%d-%m-%Y_%H.%M.%S")
+    notify("status", f"Bot loop started. Session: {session_folder}")
 
-    def game_closed():
+    screenshot_active = True if screenshot_enabled is None else get_bool(screenshot_enabled)
+    if screenshot_active:
+        success, error = ensure_data_directories(session_folder)
+        if not success:
+            notify("error", f"Unable to create screenshot directories: {error}")
+            screenshot_active = False
+
+    resolution_mode_value = DEFAULT_RESOLUTION_MODE
+    if resolution_mode is not None:
+        try:
+            resolution_mode_value = int(resolution_mode.value)
+        except Exception:
+            resolution_mode_value = DEFAULT_RESOLUTION_MODE
+
+    force_base_resolution = resolution_mode_value == RESOLUTION_MODE_FORCED
+
+    handle = check_window(force_base_resolution=force_base_resolution)
+    if not handle:
+        notify("error", "Game window not found when starting loop.")
         started.value = False
-        notify("error", "❌ ERROR: The game window is closed. Bot stopping.")
-        engine.say("Error")
-        engine.say("Bot Stopped")
-        engine.runAndWait()
-        sys.exit(1)
+        return
 
-    def check_legendary(frame, hsv_filter, current_img, save_screenshots, session_folder, wincap, legendary_params, coords):
-        """
-        Checks if the loot window contains legendary items.
-        Saves screenshot ONCE per loot window (if enabled).
-        Verifies legendary was taken and uses fallback if needed.
-        Args:
-            legendary_params: Dictionary with scaled legendary detection parameters
-            coords: Dictionary with scaled button coordinates
-        Returns: incremented current_img counter
-        """
+    current_w, current_h, scale_x, scale_y = detect_resolution_and_scale(handle)
+    if force_base_resolution:
+        scale_x = 1.0
+        scale_y = 1.0
+        current_w = GAME_RESOLUTION[0]
+        current_h = GAME_RESOLUTION[1]
+
+    notify("status", f"Detected resolution {current_w}x{current_h} (scale {scale_x:.2f}x, {scale_y:.2f}x)")
+
+    border_offset = get_window_border_offset()
+    scaled_regions = scale_crop_regions(scale_x, scale_y, border_offset)
+    coords = scale_coordinates(scale_x, scale_y)
+    legendary_params = scale_legendary_detection(scale_x, scale_y)
+
+    wincap = WindowCapture()
+    wincap.set_crop_regions(scaled_regions)
+
+    base_scaled_regions = dict(scaled_regions)
+    overlay_snapshot = None
+    overlay_active = False
+    min_template_sizes = {}
+
+    def read_overlay_regions():
+        if overlay_zones_dict is None:
+            return None
+        try:
+            shared_items = dict(overlay_zones_dict)
+        except Exception:
+            return None
+        cleaned = {}
+        for name, region in shared_items.items():
+            if not isinstance(region, dict):
+                continue
+            try:
+                cleaned[name] = {
+                    "x": int(region.get("x", 0)),
+                    "y": int(region.get("y", 0)),
+                    "w": int(region.get("w", 0)),
+                    "h": int(region.get("h", 0)),
+                }
+            except Exception:
+                continue
+        return cleaned or None
+
+    def convert_overlay_regions_to_window(regions):
+        if not regions:
+            return None
+        border_x, border_y = border_offset
+        converted = {}
+        for name, region in regions.items():
+            try:
+                size_floor = min_template_sizes.get(name, {})
+                min_w = max(1, int(size_floor.get("w", 1)))
+                min_h = max(1, int(size_floor.get("h", 1)))
+                width = max(min_w, max(1, int(region["w"])))
+                height = max(min_h, max(1, int(region["h"])))
+                converted[name] = {
+                    "x": int(region["x"] + border_x),
+                    "y": int(region["y"] + border_y),
+                    "w": width,
+                    "h": height,
+                }
+            except Exception:
+                continue
+        return converted or None
+
+    def refresh_overlay_regions(force=False):
+        nonlocal overlay_snapshot, overlay_active
+
+        flag_active = False
+        if use_overlay_zones_flag is not None:
+            try:
+                flag_active = bool(use_overlay_zones_flag.value)
+            except Exception:
+                flag_active = False
+
+        if flag_active:
+            shared = read_overlay_regions()
+            converted = convert_overlay_regions_to_window(shared)
+            if converted:
+                if force or not overlay_active or converted != overlay_snapshot:
+                    overlay_snapshot = converted
+                    overlay_active = True
+                    combined = dict(base_scaled_regions)
+                    combined.update(converted)
+                    scaled_regions.clear()
+                    scaled_regions.update(combined)
+                    wincap.set_crop_regions(scaled_regions)
+                    notify("status", f"Overlay detection zones applied ({len(converted)} regions).")
+            else:
+                if overlay_active or force:
+                    overlay_active = False
+                    overlay_snapshot = None
+                    scaled_regions.clear()
+                    scaled_regions.update(base_scaled_regions)
+                    wincap.set_crop_regions(scaled_regions)
+                    if not force:
+                        notify("status", "Overlay detection zones disabled (no custom regions).")
+        else:
+            if overlay_active or (force and overlay_snapshot is not None):
+                overlay_active = False
+                overlay_snapshot = None
+                scaled_regions.clear()
+                scaled_regions.update(base_scaled_regions)
+                wincap.set_crop_regions(scaled_regions)
+                if not force:
+                    notify("status", "Overlay detection zones disabled.")
+
+    refresh_overlay_regions(force=True)
+
+    img_dir = resource_path("img")
+
+    def load_template(name):
+        path = os.path.join(img_dir, name)
+        template = cv2.imread(path)
+        if template is None:
+            raise FileNotFoundError(f"Template missing: {name}")
+        return scale_template(template, scale_x, scale_y)
+
+    try:
+        template_open_loot = load_template('open_loot.jpg')
+        template_loot_window = load_template('loot_window.jpg')
+        template_hp_full = load_template('full_hp.jpg')
+        template_hp_damaged = load_template('damaged_hp.jpg')
+        template_hp_empty = load_template('empty_hp.jpg')
+    except Exception as exc:
+        notify("error", f"Failed to load templates: {exc}")
+        started.value = False
+        return
+
+    vision_open_loot = Vision(None)
+    vision_open_loot.needle_img = template_open_loot
+    vision_open_loot.needle_w = template_open_loot.shape[1]
+    vision_open_loot.needle_h = template_open_loot.shape[0]
+
+    vision_loot_window = Vision(None)
+    vision_loot_window.needle_img = template_loot_window
+    vision_loot_window.needle_w = template_loot_window.shape[1]
+    vision_loot_window.needle_h = template_loot_window.shape[0]
+
+    vision_enemy_hp_full = Vision(None)
+    vision_enemy_hp_full.needle_img = template_hp_full
+    vision_enemy_hp_full.needle_w = template_hp_full.shape[1]
+    vision_enemy_hp_full.needle_h = template_hp_full.shape[0]
+
+    vision_enemy_hp_damaged = Vision(None)
+    vision_enemy_hp_damaged.needle_img = template_hp_damaged
+    vision_enemy_hp_damaged.needle_w = template_hp_damaged.shape[1]
+    vision_enemy_hp_damaged.needle_h = template_hp_damaged.shape[0]
+
+    vision_enemy_hp_empty = Vision(None)
+    vision_enemy_hp_empty.needle_img = template_hp_empty
+    vision_enemy_hp_empty.needle_w = template_hp_empty.shape[1]
+    vision_enemy_hp_empty.needle_h = template_hp_empty.shape[0]
+
+    template_requirements = {
+        'crop_open_loot': (vision_open_loot.needle_w, vision_open_loot.needle_h),
+        'crop_loot_window': (vision_loot_window.needle_w, vision_loot_window.needle_h),
+        'crop_enemy_hp': (
+            max(vision_enemy_hp_full.needle_w, vision_enemy_hp_damaged.needle_w, vision_enemy_hp_empty.needle_w),
+            max(vision_enemy_hp_full.needle_h, vision_enemy_hp_damaged.needle_h, vision_enemy_hp_empty.needle_h),
+        ),
+    }
+
+    for name, (tpl_w, tpl_h) in template_requirements.items():
+        min_template_sizes[name] = {
+            "w": max(1, int(tpl_w)),
+            "h": max(1, int(tpl_h)),
+        }
+
+    overlay_invalid_zones = set()
+
+    def zone_detection_allowed(zone_name):
+        region = scaled_regions.get(zone_name)
+        if region is None:
+            return False
+        min_w, min_h = template_requirements.get(zone_name, (1, 1))
+        if region['w'] < min_w or region['h'] < min_h:
+            if zone_name not in overlay_invalid_zones:
+                notify(
+                    "status",
+                    (
+                        f"Overlay zone '{zone_name}' is smaller than required template size "
+                        f"({region['w']}x{region['h']} vs >= {min_w}x{min_h}); enlarge it in the overlay."
+                    ),
+                )
+                overlay_invalid_zones.add(zone_name)
+            return False
+        overlay_invalid_zones.discard(zone_name)
+        return True
+
+    vision_loot = Vision(None)
+
+    hsv_filter_red = HsvFilter(**HSV_LEGENDARY_RED)
+
+    threshold_adjustment = 1.0
+    if scale_x < 1.0 or scale_y < 1.0:
+        min_scale = min(scale_x, scale_y)
+        threshold_adjustment = 0.85 + (min_scale * 0.15)
+        notify("status", f"Resolution below 1280x800 detected; adjusting thresholds by {threshold_adjustment:.2f}")
+
+    overlay_stop_event = threading.Event()
+    overlay_thread = None
+    if overlay_enabled is not None:
+        overlay_thread = threading.Thread(
+            target=overlay_update_thread,
+            args=(
+                overlay_enabled,
+                overlay_stop_event,
+                status_queue,
+                scaled_regions,
+                threshold_open_loot,
+                threshold_loot_window,
+                threshold_hp_full,
+                threshold_hp_damaged,
+                scale_x,
+                scale_y,
+                template_open_loot,
+                template_loot_window,
+                template_hp_full,
+                template_hp_damaged,
+                border_offset,
+                current_w,
+                current_h,
+            ),
+            daemon=True,
+        )
+        overlay_thread.start()
+
+    processed_loot = {}
+    attacking_logged = False
+    current_img = _initial_image_index()
+    last_manual_capture = manual_capture_trigger.value if manual_capture_trigger else 0
+
+    def check_legendary(frame, save_screenshots):
+        nonlocal current_img
         try:
             if save_screenshots:
-                ensure_data_directories(session_folder)
+                success, error = ensure_data_directories(session_folder)
+                if not success:
+                    notify("error", f"Screenshot directory error: {error}")
+                    save_screenshots = False
 
-            mask = vision_loot.apply_hsv_filter(frame, hsv_filter)
+            mask = vision_loot.apply_hsv_filter(frame, hsv_filter_red)
             kernel = np.ones(DILATION_KERNEL_SIZE, "uint8")
             mask = cv2.dilate(mask, kernel)
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
+            range_1_start = legendary_params['RANGE_1_START']
+            range_1_end = legendary_params['RANGE_1_END']
+            range_2_start = legendary_params['RANGE_2_START']
+            range_2_end = legendary_params['RANGE_2_END']
+
             is_legendary = False
-            legendary_x, legendary_y = None, None
-            legendary_coords = None
+            legendary_x = None
+            legendary_y = None
 
-            # Check all contours for legendary items
-            if contours:
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > MIN_CONTOUR_AREA:
-                        x, y, w, h = cv2.boundingRect(contour)
-                        calculated_x = x + legendary_params['OFFSET_X']
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area <= MIN_CONTOUR_AREA:
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                calculated_x = x + legendary_params['OFFSET_X']
+                if (range_1_start <= calculated_x <= range_1_end) or (range_2_start <= calculated_x <= range_2_end):
+                    is_legendary = True
+                    legendary_x = calculated_x
+                    legendary_y = y + legendary_params['OFFSET_Y']
+                    break
 
-                        # Check if item is in legendary position (using scaled ranges)
-                        range_1 = range(legendary_params['RANGE_1_START'], legendary_params['RANGE_1_END'])
-                        range_2 = range(legendary_params['RANGE_2_START'], legendary_params['RANGE_2_END'])
-                        if calculated_x in range_1 or calculated_x in range_2:
-                            is_legendary = True
-                            legendary_x = calculated_x
-                            legendary_y = y + legendary_params['OFFSET_Y']
-                            legendary_coords = (x, y)
-                            break  # Found legendary, stop searching
-
-            # Save screenshot ONCE based on result (if enabled)
-            if is_legendary:
-                notify("status", f"💎 Legendary item detected at position ({legendary_x}, {legendary_y}).")
-                legendary_path = None
+            if is_legendary and legendary_x is not None and legendary_y is not None:
+                notify("status", f"Legendary item detected at ({legendary_x}, {legendary_y}).")
                 if save_screenshots:
-                    legendary_path = get_screenshot_path(session_folder, f'Legendary_{current_img}.jpg', legendary=True)
-                    cv2.imwrite(legendary_path, frame)
-                    notify("status", f"📸 Screenshot saved: Legendary_{current_img}.jpg")
-
-                time_elapsed = datetime.now().replace(microsecond=0) - start_time.replace(microsecond=0)
+                    path = get_screenshot_path(session_folder, f'Legendary_{current_img}.jpg', legendary=True)
+                    cv2.imwrite(path, frame)
+                    notify("status", f"Screenshot saved: {os.path.basename(path)}")
 
                 engine.say("Legendary Found")
                 engine.runAndWait()
 
-                # LEGENDARY VERIFICATION FLOW
-                # Double-click puts legendary in backpack, but may fail due to network lag
-                # Verification: Screenshot → Re-detect → If still visible: Try fallback method
-                notify("status", "🖱️ Double-clicking legendary item (1st attempt).")
-                click_with_logging(legendary_x, legendary_y, "Legendary 1st click")
-                click_with_logging(legendary_x, legendary_y, "Legendary 2nd click")
+                notify("status", "Double-clicking legendary item (attempt 1).")
+                click_with_logging(legendary_x, legendary_y, "Legendary click 1")
+                click_with_logging(legendary_x, legendary_y, "Legendary click 2")
 
-                # Verification: Check if legendary was taken
-                notify("status", "🔎 Waiting 1s, then verifying legendary was taken.")
-                sleep(1.0)  # Wait for double-click to process
+                notify("status", "Waiting 1s before verification.")
+                sleep(1.0)
 
-                # Capture verification screenshot
                 verification_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_loot_window')
-
-                # Re-run legendary detection on verification frame
-                verification_mask = vision_loot.apply_hsv_filter(verification_frame, hsv_filter)
-                kernel = np.ones(DILATION_KERNEL_SIZE, "uint8")
+                verification_mask = vision_loot.apply_hsv_filter(verification_frame, hsv_filter_red)
                 verification_mask = cv2.dilate(verification_mask, kernel)
                 verification_contours, _ = cv2.findContours(verification_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-                legendary_still_there = False
+                legendary_still_visible = False
                 for contour in verification_contours:
                     area = cv2.contourArea(contour)
-                    if area > MIN_CONTOUR_AREA:
-                        vx, vy, vw, vh = cv2.boundingRect(contour)
-                        calc_x = vx + legendary_params['OFFSET_X']
-                        range_1 = range(legendary_params['RANGE_1_START'], legendary_params['RANGE_1_END'])
-                        range_2 = range(legendary_params['RANGE_2_START'], legendary_params['RANGE_2_END'])
-                        if calc_x in range_1 or calc_x in range_2:
-                            legendary_still_there = True
-                            break
+                    if area <= MIN_CONTOUR_AREA:
+                        continue
+                    vx, vy, vw, vh = cv2.boundingRect(contour)
+                    calc_x = vx + legendary_params['OFFSET_X']
+                    if (range_1_start <= calc_x <= range_1_end) or (range_2_start <= calc_x <= range_2_end):
+                        legendary_still_visible = True
+                        break
 
-                # Fallback if legendary still visible
-                if legendary_still_there:
-                    notify("status", "⚠️ Verification: Legendary STILL VISIBLE after 1st attempt!")
-                    # Double-click again (second attempt)
-                    notify("status", "🔁 Double-clicking legendary item (2nd attempt).")
-                    click_with_logging(legendary_x, legendary_y, "Legendary retry 1st click")
-                    click_with_logging(legendary_x, legendary_y, "Legendary retry 2nd click")
-                    sleep(1.0)
-
-                    # Click "Take Small Items" once (fallback)
-                    notify("status", "🆘 Clicking 'Take Small Items' button (fallback method).")
-                    click_with_logging(*coords['TAKE_SMALL_ITEMS_BUTTON'], label="Take Small Items (fallback)")
-
-                    # Save fallback screenshot
+                if legendary_still_visible:
+                    notify("status", "Legendary still visible; retrying double-click and fallback.")
+                    if actions_enabled():
+                        click_with_logging(legendary_x, legendary_y, "Legendary retry 1")
+                        click_with_logging(legendary_x, legendary_y, "Legendary retry 2")
+                        sleep(1.0)
+                        click_with_logging(*coords['TAKE_SMALL_ITEMS_BUTTON'], label="Take Small Items fallback")
+                    else:
+                        notify("status", "[DRY RUN] Would retry legendary clicks and fallback")
+                        sleep(1.0)
                     if save_screenshots:
-                        fallback_path = get_screenshot_path(session_folder, f'Legendary_{current_img}.jpg', legendary=True, fallback=True)
+                        fallback_path = get_screenshot_path(
+                            session_folder,
+                            f'Legendary_{current_img}.jpg',
+                            legendary=True,
+                            fallback=True,
+                        )
                         cv2.imwrite(fallback_path, verification_frame)
-                        notify("status", f"📷 Fallback screenshot saved: Legendary_{current_img}_FALLBACK.jpg")
-
-                    notify("legendary_fallback", "🆘 Legendary required Take All fallback",
-                           loot_count=int(loot_opened.value))
+                        notify("status", f"Fallback screenshot saved: {os.path.basename(fallback_path)}")
+                    notify("legendary_fallback", "Legendary required fallback", loot_count=int(loot_opened.value))
                 else:
-                    notify("status", "🏆 Verification: Legendary successfully taken!")
-                    notify("legendary_success", "🏆 Legendary taken successfully by double-click",
-                           loot_count=int(loot_opened.value))
+                    notify("status", "Legendary confirmed collected.")
+                    notify("legendary_success", "Legendary collected successfully", loot_count=int(loot_opened.value))
 
-                legendaries.value += 1
-
-                info_path = None
-                if save_screenshots:
-                    info_path = get_info_path(session_folder, f'Legendary_Info_{current_img}.txt')
-                    with open(info_path, 'a') as f_handle:
-                        f_handle.write(f'################################################\n'
-                                       f'Legendary_{current_img}\n'
-                                       f'Original coordinates: {legendary_coords}\n'
-                                       f'Calculated coordinates: {legendary_x, legendary_y}\n'
-                                       f'Time elapsed to find the legendary: {time_elapsed}\n'
-                                       f'################################################\n\n')
-
-                notify(
-                    "legendary",
-                    "Legendary loot detected.",
-                    loot_count=int(loot_opened.value),
-                    legendary_count=int(legendaries.value),
-                    screenshot=legendary_path,
-                    info_file=info_path,
-                )
+                current_img += 1
+                with legendaries.get_lock():
+                    legendaries.value += 1
+                notify("legendary", "Legendary loot recorded.", legendary=True, legendary_count=int(legendaries.value))
             else:
-                notify("status", "📦 No legendary items detected, regular loot only.")
+                notify("status", "No legendary items detected in loot window.")
                 if save_screenshots:
-                    regular_path = get_screenshot_path(session_folder, f'{current_img}.jpg', legendary=False)
-                    cv2.imwrite(regular_path, frame)
-                    notify("status", f"📄 Regular loot screenshot saved: {current_img}.jpg")
+                    path = get_screenshot_path(session_folder, f'{current_img}.jpg', legendary=False)
+                    cv2.imwrite(path, frame)
+                    notify("status", f"Regular loot screenshot saved: {os.path.basename(path)}")
+                current_img += 1
 
-            return current_img + 1
+        except Exception as exc:
+            notify("error", f"Legendary detection error: {exc}")
+            current_img += 1
 
-        except Exception as e:
-            notify("error", f"❌ Error in check_legendary: {e}")
-            # Still increment counter even on error to avoid overwrites
-            return current_img + 1
-
-    # Initialize screenshot counter (always starts at 1 for each session)
-    current_img = _initial_image_index()
-
-    # Create session folder name with timestamp
-    start_time = datetime.now()
-    session_folder = start_time.strftime("Session_%d-%m-%Y_%H.%M.%S")
-    notify("status", f"🏴‍☠️ Bot loop started. Session: {session_folder}")
-
-    handle = check_window()
-    if not handle:
-        game_closed()
-        return
-
-    wincap = WindowCapture()
-
-    # ═══════════════════════════════════════
-    # RESOLUTION DETECTION & SCALING
-    # ═══════════════════════════════════════
-    notify("status", "🔍 Detecting game resolution...")
-    current_w, current_h, scale_x, scale_y = detect_resolution_and_scale(handle)
-    notify("status", f"📐 Resolution: {current_w}x{current_h} | Scale: {scale_x:.2f}x, {scale_y:.2f}x")
-
-    # Detect window border offset (fixed pixels, don't scale)
-    border_offset = wincap.get_client_offset(GAME_WINDOW_TITLE)
-    notify("status", f"🖼️ Window border offset: {border_offset[0]}px (left), {border_offset[1]}px (top)")
-
-    # Send resolution info to GUI for debug display (including border offset)
-    notify("resolution_detected", resolution=f"{current_w}x{current_h}", scale_x=scale_x, scale_y=scale_y, border_offset=border_offset)
-
-    # Scale crop regions and set them on WindowCapture
-    scaled_regions = scale_crop_regions(scale_x, scale_y, border_offset)
-    wincap.set_crop_regions(scaled_regions)
-    notify("status", "✅ Crop regions scaled to current resolution")
-
-    # Scale button coordinates
-    coords = scale_coordinates(scale_x, scale_y)
-    notify("status", f"✅ Button coordinates scaled")
-
-    # Scale legendary detection parameters
-    legendary_params = scale_legendary_detection(scale_x, scale_y)
-    notify("status", "✅ Legendary detection parameters scaled")
-
-    # Get base thresholds from shared memory (if provided) or use constants
-    base_threshold_open_loot = float(threshold_open_loot.value) if threshold_open_loot else THRESHOLD_OPEN_LOOT
-    base_threshold_loot_window = float(threshold_loot_window.value) if threshold_loot_window else THRESHOLD_LOOT_WINDOW
-    base_threshold_hp_full = float(threshold_hp_full.value) if threshold_hp_full else THRESHOLD_HP_FULL
-    base_threshold_hp_damaged = float(threshold_hp_damaged.value) if threshold_hp_damaged else THRESHOLD_HP_DAMAGED
-    base_threshold_hp_empty = float(threshold_hp_empty.value) if threshold_hp_empty else THRESHOLD_HP_EMPTY
-
-    notify("status", f"📊 Using thresholds: Open={base_threshold_open_loot:.2f}, Loot={base_threshold_loot_window:.2f}, "
-                     f"HP Full={base_threshold_hp_full:.2f}, HP Dmg={base_threshold_hp_damaged:.2f}, HP Empty={base_threshold_hp_empty:.2f}")
-
-    # Adjust thresholds for low resolutions (downscaling loses quality)
-    # At 1024x768 (0.80x), templates lose detail, so lower thresholds
-    threshold_adjustment = 1.0
-    if scale_x < 1.0 or scale_y < 1.0:
-        # For downscaling, reduce thresholds by up to 15%
-        min_scale = min(scale_x, scale_y)
-        threshold_adjustment = 0.85 + (min_scale * 0.15)  # Range: 0.85 to 1.0
-        notify("status", f"⚠️ Low resolution detected - adjusting thresholds ({threshold_adjustment:.2f}x)")
-
-    # Calculate adjusted thresholds (user-set values * resolution adjustment)
-    adjusted_thresholds = {
-        'OPEN_LOOT': base_threshold_open_loot * threshold_adjustment,
-        'LOOT_WINDOW': base_threshold_loot_window * threshold_adjustment,
-        'HP_FULL': base_threshold_hp_full * threshold_adjustment,
-        'HP_DAMAGED': base_threshold_hp_damaged * threshold_adjustment,
-        'HP_EMPTY': base_threshold_hp_empty * threshold_adjustment,
-    }
-
-    # Initialize overlay thread variables
-    overlay_stop_event = None
-    overlay_thread = None
-
-    # Load and scale templates
     try:
-        notify("status", "📸 Loading template images...")
-        # Load original templates
-        template_open_loot = cv2.imread(img_dir + '\\open_loot.jpg')
-        template_loot_window = cv2.imread(img_dir + '\\loot_window.jpg')
-        template_hp_full = cv2.imread(img_dir + '\\full_hp.jpg')
-        template_hp_damaged = cv2.imread(img_dir + '\\damaged_hp.jpg')
-        template_hp_empty = cv2.imread(img_dir + '\\empty_hp.jpg')
+        while True:
+            sleep(LOOP_DELAY)
 
-        # Scale templates to current resolution
-        if scale_x != 1.0 or scale_y != 1.0:
-            notify("status", f"🔧 Scaling templates by {scale_x:.2f}x, {scale_y:.2f}x...")
-            template_open_loot = scale_template(template_open_loot, scale_x, scale_y)
-            template_loot_window = scale_template(template_loot_window, scale_x, scale_y)
-            template_hp_full = scale_template(template_hp_full, scale_x, scale_y)
-            template_hp_damaged = scale_template(template_hp_damaged, scale_x, scale_y)
-            template_hp_empty = scale_template(template_hp_empty, scale_x, scale_y)
-            notify("status", "✅ Templates scaled successfully")
-        else:
-            notify("status", "✅ Using original templates (no scaling needed)")
+            refresh_overlay_regions()
 
-        # Create Vision objects with scaled templates
-        vision_open_loot = Vision(None)
-        vision_open_loot.needle_img = template_open_loot
-        vision_open_loot.needle_w = template_open_loot.shape[1]
-        vision_open_loot.needle_h = template_open_loot.shape[0]
+            if check_window(force_base_resolution=force_base_resolution) == 0:
+                notify("status", "Game window closed; stopping bot.")
+                break
 
-        vision_loot_window = Vision(None)
-        vision_loot_window.needle_img = template_loot_window
-        vision_loot_window.needle_w = template_loot_window.shape[1]
-        vision_loot_window.needle_h = template_loot_window.shape[0]
+            save_screenshots = screenshot_active and (get_bool(screenshot_enabled) if screenshot_enabled else True)
 
-        vision_enemy_hp_full = Vision(None)
-        vision_enemy_hp_full.needle_img = template_hp_full
-        vision_enemy_hp_full.needle_w = template_hp_full.shape[1]
-        vision_enemy_hp_full.needle_h = template_hp_full.shape[0]
+            current_threshold_open = get_float(threshold_open_loot, THRESHOLD_OPEN_LOOT) * threshold_adjustment
+            current_threshold_loot = get_float(threshold_loot_window, THRESHOLD_LOOT_WINDOW) * threshold_adjustment
+            current_threshold_hp_full = get_float(threshold_hp_full, THRESHOLD_HP_FULL) * threshold_adjustment
+            current_threshold_hp_damaged = get_float(threshold_hp_damaged, THRESHOLD_HP_DAMAGED) * threshold_adjustment
+            current_threshold_hp_empty = get_float(threshold_hp_empty, THRESHOLD_HP_EMPTY)
 
-        vision_enemy_hp_damaged = Vision(None)
-        vision_enemy_hp_damaged.needle_img = template_hp_damaged
-        vision_enemy_hp_damaged.needle_w = template_hp_damaged.shape[1]
-        vision_enemy_hp_damaged.needle_h = template_hp_damaged.shape[0]
-
-        vision_enemy_hp_empty = Vision(None)
-        vision_enemy_hp_empty.needle_img = template_hp_empty
-        vision_enemy_hp_empty.needle_w = template_hp_empty.shape[1]
-        vision_enemy_hp_empty.needle_h = template_hp_empty.shape[0]
-
-        vision_loot = Vision(None)
-
-        notify("status", "✅ All templates loaded and ready")
-
-        # Start overlay update thread (30+ FPS) - after templates are loaded
-        if overlay_enabled:
-            overlay_stop_event = threading.Event()
-            overlay_thread = threading.Thread(
-                target=overlay_update_thread,
-                args=(overlay_enabled, overlay_stop_event, status_queue, scaled_regions,
-                      threshold_open_loot, threshold_loot_window, threshold_hp_full,
-                      threshold_hp_damaged, scale_x, scale_y,
-                      template_open_loot, template_loot_window, template_hp_full,
-                      template_hp_damaged, border_offset, current_w, current_h),
-                daemon=True
-            )
-            overlay_thread.start()
-            notify("status", "✅ Overlay thread started (30 FPS)")
-
-    except Exception as e:
-        notify("error", f"❌ Failed to load template images: {e}")
-        started.value = False
-        return
-
-    # Create HSV filter from constants
-    hsv_filter_red = HsvFilter(**HSV_LEGENDARY_RED)
-
-    # DUPLICATE DETECTION SYSTEM
-    # Problem: Game messages overlay loot window, causing same window to be detected multiple times
-    # Solution: Three-layer protection:
-    #   1. Message detection - Skip processing if message overlay present (wait for clean view)
-    #   2. Hash comparison - Skip if identical frame already processed (prevents double-clicking same window)
-    #   3. Timestamp cleanup - Remove old hashes after 5min to prevent memory leak
-    processed_loot = {}  # {hash: timestamp}
-
-    # Track if we've logged the attack message for current enemy
-    attacking_logged = False
-
-    # Debug screenshot counters (limit to first 5 examples of each type)
-    debug_counters = {
-        'open_loot': 0,
-        'loot_window': 0,
-        'hp_full': 0,
-        'hp_damaged': 0,
-        'hp_empty': 0
-    }
-    MAX_DEBUG_SCREENSHOTS = 5
-
-    def get_current_thresholds():
-        """
-        Read current thresholds from shared memory and apply resolution adjustment.
-        This allows thresholds to be changed live without restarting the bot.
-        Returns: Dictionary of adjusted thresholds
-        """
-        # Read current base thresholds from shared memory
-        base_open_loot = float(threshold_open_loot.value) if threshold_open_loot else THRESHOLD_OPEN_LOOT
-        base_loot_window = float(threshold_loot_window.value) if threshold_loot_window else THRESHOLD_LOOT_WINDOW
-        base_hp_full = float(threshold_hp_full.value) if threshold_hp_full else THRESHOLD_HP_FULL
-        base_hp_damaged = float(threshold_hp_damaged.value) if threshold_hp_damaged else THRESHOLD_HP_DAMAGED
-        base_hp_empty = float(threshold_hp_empty.value) if threshold_hp_empty else THRESHOLD_HP_EMPTY
-
-        # Apply resolution adjustment (calculated at startup)
-        return {
-            'OPEN_LOOT': base_open_loot * threshold_adjustment,
-            'LOOT_WINDOW': base_loot_window * threshold_adjustment,
-            'HP_FULL': base_hp_full * threshold_adjustment,
-            'HP_DAMAGED': base_hp_damaged * threshold_adjustment,
-            'HP_EMPTY': base_hp_empty * threshold_adjustment,
-        }
-
-    # Track last manual capture trigger value to detect changes
-    last_manual_trigger = 0
-
-    while True:
-        sleep(LOOP_DELAY)
-
-        if check_window() != 0:
-            try:
-                # Get current thresholds (allows live updates)
-                current_thresholds = get_current_thresholds()
-
-                # Check for manual capture trigger (button press)
-                manual_capture_now = False
-                if manual_capture_trigger:
-                    current_trigger = int(manual_capture_trigger.value)
-                    if current_trigger != last_manual_trigger:
-                        last_manual_trigger = current_trigger
-                        manual_capture_now = True
-                        notify("status", "📸 Manual capture triggered! Saving screenshots of all detection zones...")
-
+            open_loot_frame = None
+            rectangles_open_loot = np.empty((0,), dtype=np.float32)
+            if zone_detection_allowed('crop_open_loot'):
                 open_loot_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_open_loot')
-                rectangles_open_loot = vision_open_loot.find(open_loot_frame, current_thresholds['OPEN_LOOT'])
-
-                # Save debug screenshot (auto or manual trigger)
-                should_save_open_loot = False
-                if manual_capture_now:
-                    should_save_open_loot = True  # Manual capture ignores flags and counters
-                elif debug_mode and bool(debug_mode.value) and debug_capture_open_loot and bool(debug_capture_open_loot.value) and debug_counters['open_loot'] < MAX_DEBUG_SCREENSHOTS:
-                    should_save_open_loot = True
-
-                if should_save_open_loot:
-                    timestamp = datetime.now().strftime("%H%M%S_%f")
-                    if manual_capture_now:
-                        timestamp = f"MANUAL_{timestamp}"
-                    save_debug_screenshot(open_loot_frame, template_open_loot, 'open_loot', timestamp, current_thresholds['OPEN_LOOT'])
-                    if not manual_capture_now:
-                        debug_counters['open_loot'] += 1
-
-                if rectangles_open_loot.any():
-                    if show_confidence and bool(show_confidence.value):
-                        notify("detection", f"Detected: Open Loot Prompt", template="Open Loot", confidence=current_thresholds['OPEN_LOOT'])
-                    notify("status", "🗝️ Open loot prompt detected, pressing Shift.")
+                rectangles_open_loot = vision_open_loot.find(open_loot_frame, current_threshold_open)
+            if rectangles_open_loot.any():
+                if open_loot_frame is not None:
+                    capture_debug('open_loot', open_loot_frame, template_open_loot, current_threshold_open)
+                if actions_enabled():
+                    notify("status", "Open loot prompt detected; pressing Shift.")
                     sleep(LOOT_OPEN_PRE_DELAY)
                     press_shift()
-                    notify("status", "🔓 Shift pressed, waiting for loot window to open.")
+                    notify("status", "Shift pressed; waiting for loot window.")
                     sleep(LOOT_OPEN_POST_DELAY)
+                else:
+                    notify("status", "[DRY RUN] Would press Shift to open loot")
+                    sleep(LOOT_OPEN_PRE_DELAY + LOOT_OPEN_POST_DELAY)
 
+            loot_frame = None
+            rectangles_loot_window = np.empty((0,), dtype=np.float32)
+            if zone_detection_allowed('crop_loot_window'):
                 loot_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_loot_window')
-                rectangles_loot_window = vision_loot_window.find(loot_frame, current_thresholds['LOOT_WINDOW'])
+                rectangles_loot_window = vision_loot_window.find(loot_frame, current_threshold_loot)
+            if rectangles_loot_window.any():
+                if loot_frame is not None:
+                    capture_debug('loot_window', loot_frame, template_loot_window, current_threshold_loot)
 
-                # Save debug screenshot (auto or manual trigger)
-                should_save_loot_window = False
-                if manual_capture_now:
-                    should_save_loot_window = True
-                elif debug_mode and bool(debug_mode.value) and debug_capture_loot_window and bool(debug_capture_loot_window.value) and debug_counters['loot_window'] < MAX_DEBUG_SCREENSHOTS:
-                    should_save_loot_window = True
+                if has_message_overlay(loot_frame):
+                    notify("status", "Loot window has overlay text; waiting for clear view.")
+                    continue
 
-                if should_save_loot_window:
-                    timestamp = datetime.now().strftime("%H%M%S_%f")
-                    if manual_capture_now:
-                        timestamp = f"MANUAL_{timestamp}"
-                    save_debug_screenshot(loot_frame, template_loot_window, 'loot_window', timestamp, current_thresholds['LOOT_WINDOW'])
-                    if not manual_capture_now:
-                        debug_counters['loot_window'] += 1
+                loot_hash = hashlib.md5(loot_frame.tobytes()).hexdigest()
+                now_ts = time.time()
+                processed_loot = {h: t for h, t in processed_loot.items() if now_ts - t < 300}
+                if loot_hash in processed_loot:
+                    notify("status", "Duplicate loot window detected; skipping.")
+                    continue
+                processed_loot[loot_hash] = now_ts
 
-                if rectangles_loot_window.any():
-                    if show_confidence and bool(show_confidence.value):
-                        notify("detection", f"Detected: Loot Window", template="Loot Window", confidence=current_thresholds['LOOT_WINDOW'])
-                    # Check for message overlays first
-                    if has_message_overlay(loot_frame):
-                        notify("status", "💬 Loot window detected with message overlay, waiting for clear view.")
-                        continue  # Skip processing until message disappears
+                loot_opened.value += 1
+                notify("status", "Processing loot window.")
+                check_legendary(loot_frame, save_screenshots)
+                notify("loot", "Loot window processed.", loot_count=int(loot_opened.value), legendary_count=int(legendaries.value))
 
-                    # Calculate hash to detect duplicate windows
-                    current_hash = hashlib.md5(loot_frame.tobytes()).hexdigest()
-                    current_time = time.time()
-
-                    # Clean up old hashes (> 5 minutes old)
-                    processed_loot = {h: t for h, t in processed_loot.items()
-                                      if current_time - t < 300}
-
-                    # Check if we already processed this window
-                    if current_hash in processed_loot:
-                        time_since = current_time - processed_loot[current_hash]
-                        notify("status", f"🔁 Duplicate loot window detected ({time_since:.1f}s ago), skipping.")
-                        continue  # Skip to next loop iteration
-
-                    # Store hash with timestamp
-                    processed_loot[current_hash] = current_time
-
-                    notify("status", "✨ Clean loot window detected, processing.")
-                    loot_opened.value += 1
-                    # Read screenshot enabled state from shared memory (allows real-time toggle)
-                    save_screenshots = bool(screenshot_enabled.value) if screenshot_enabled is not None else True
-                    current_img = check_legendary(loot_frame, hsv_filter_red, current_img, save_screenshots, session_folder, wincap, legendary_params, coords)
-                    notify(
-                        "loot",
-                        "Loot window processed.",
-                        loot_count=int(loot_opened.value),
-                        legendary_count=int(legendaries.value),
-                    )
-                    notify("status", "👆 Clicking 'Take Small Items' button.")
+                if actions_enabled():
                     click_with_logging(*coords['TAKE_SMALL_ITEMS_BUTTON'], label="Take Small Items")
                     sleep(TAKE_ITEMS_DELAY)
+                else:
+                    notify("status", "[DRY RUN] Would click Take Small Items button")
+                    sleep(TAKE_ITEMS_DELAY)
 
-                    notify("status", "👀 Checking if items remain in loot window.")
-                    loot_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_loot_window')
-                    rectangles_loot_window = vision_loot_window.find(loot_frame, current_thresholds['LOOT_WINDOW'])
-
-                    if rectangles_loot_window.any():
-                        notify("status", "🗑️ Items still remain, clicking 'Trash' button.")
-                        click_with_logging(*coords['TRASH_BUTTON'], label="Trash")
-                        sleep(TAKE_ITEMS_DELAY)
+                loot_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_loot_window')
+                rectangles_loot_window = vision_loot_window.find(loot_frame, current_threshold_loot)
+                if rectangles_loot_window.any():
+                    if actions_enabled():
+                        notify("status", "Items remain; clicking Trash.")
+                        click_with_logging(*coords['TRASH_BUTTON'], label="Trash Button")
                     else:
-                        notify("status", "✅ All items collected, loot window closed.")
-                        # Clear click visualizations after loot cycle completes
-                        notify("overlay_clear_clicks")
+                        notify("status", "[DRY RUN] Would click Trash button")
+                    sleep(TAKE_ITEMS_DELAY)
+                else:
+                    notify("status", "Loot window cleared.")
 
+            enemy_hp_frame = None
+            rectangles_enemy_hp_full = np.empty((0,), dtype=np.float32)
+            rectangles_enemy_hp_damaged = np.empty((0,), dtype=np.float32)
+            rectangles_enemy_hp_empty = np.empty((0,), dtype=np.float32)
+            if zone_detection_allowed('crop_enemy_hp'):
                 enemy_hp_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_enemy_hp')
-                rectangles_enemy_hp_full = vision_enemy_hp_full.find(enemy_hp_frame, current_thresholds['HP_FULL'])
-                rectangles_enemy_hp_damaged = vision_enemy_hp_damaged.find(enemy_hp_frame, current_thresholds['HP_DAMAGED'])
-                rectangles_enemy_hp_empty = vision_enemy_hp_empty.find(enemy_hp_frame, current_thresholds['HP_EMPTY'])
+                rectangles_enemy_hp_full = vision_enemy_hp_full.find(enemy_hp_frame, current_threshold_hp_full)
+                rectangles_enemy_hp_damaged = vision_enemy_hp_damaged.find(enemy_hp_frame, current_threshold_hp_damaged)
+                rectangles_enemy_hp_empty = vision_enemy_hp_empty.find(enemy_hp_frame, current_threshold_hp_empty)
 
-                # Save debug screenshots (auto or manual trigger)
-                timestamp = datetime.now().strftime("%H%M%S_%f")
-                if manual_capture_now:
-                    timestamp = f"MANUAL_{timestamp}"
-                    # Manual capture: save all 3 HP templates
-                    save_debug_screenshot(enemy_hp_frame, template_hp_full, 'hp_full', timestamp, current_thresholds['HP_FULL'])
-                    save_debug_screenshot(enemy_hp_frame, template_hp_damaged, 'hp_damaged', timestamp, current_thresholds['HP_DAMAGED'])
-                    save_debug_screenshot(enemy_hp_frame, template_hp_empty, 'hp_empty', timestamp, current_thresholds['HP_EMPTY'])
-                elif debug_mode and bool(debug_mode.value):
-                    # Auto capture: respect flags and counters
-                    if debug_capture_hp_full and bool(debug_capture_hp_full.value) and debug_counters['hp_full'] < MAX_DEBUG_SCREENSHOTS:
-                        save_debug_screenshot(enemy_hp_frame, template_hp_full, 'hp_full', timestamp, current_thresholds['HP_FULL'])
-                        debug_counters['hp_full'] += 1
-                    if debug_capture_hp_damaged and bool(debug_capture_hp_damaged.value) and debug_counters['hp_damaged'] < MAX_DEBUG_SCREENSHOTS:
-                        save_debug_screenshot(enemy_hp_frame, template_hp_damaged, 'hp_damaged', timestamp, current_thresholds['HP_DAMAGED'])
-                        debug_counters['hp_damaged'] += 1
-                    if debug_capture_hp_empty and bool(debug_capture_hp_empty.value) and debug_counters['hp_empty'] < MAX_DEBUG_SCREENSHOTS:
-                        save_debug_screenshot(enemy_hp_frame, template_hp_empty, 'hp_empty', timestamp, current_thresholds['HP_EMPTY'])
-                        debug_counters['hp_empty'] += 1
-
-                if rectangles_enemy_hp_full.any() or rectangles_enemy_hp_damaged.any() or rectangles_enemy_hp_empty.any():
-                    if show_confidence and bool(show_confidence.value):
-                        if rectangles_enemy_hp_full.any():
-                            notify("detection", f"Detected: Enemy HP Full", template="HP Full", confidence=current_thresholds['HP_FULL'])
-                        elif rectangles_enemy_hp_damaged.any():
-                            notify("detection", f"Detected: Enemy HP Damaged", template="HP Damaged", confidence=current_thresholds['HP_DAMAGED'])
-                        elif rectangles_enemy_hp_empty.any():
-                            notify("detection", f"Detected: Enemy HP Empty", template="HP Empty", confidence=current_thresholds['HP_EMPTY'])
-
-                    if not rectangles_enemy_hp_damaged.any() and not rectangles_enemy_hp_empty.any():
-                        # New enemy detected - reset attack logging flag
-                        attacking_logged = False
-                        notify("status", f"☠️ Enemy detected (full HP), waiting {wait_after_enemy_spawn.value}s before engaging.")
-                        sleep(wait_after_enemy_spawn.value)
-                        notify("status", "⚔️ Starting combat sequence (3x Ctrl).")
+            if rectangles_enemy_hp_full.any() or rectangles_enemy_hp_damaged.any() or rectangles_enemy_hp_empty.any():
+                if rectangles_enemy_hp_full.any() and not rectangles_enemy_hp_damaged.any() and not rectangles_enemy_hp_empty.any():
+                    attacking_logged = False
+                    notify("status", f"Enemy detected; waiting {wait_after_enemy_spawn.value}s before engaging.")
+                    sleep(wait_after_enemy_spawn.value)
+                    if actions_enabled():
+                        notify("status", "Starting combat sequence (3x Ctrl).")
                         press_ctrl()
                         press_ctrl()
                         press_ctrl()
                         sleep(INITIAL_ATTACK_DELAY)
+                    else:
+                        notify("status", "[DRY RUN] Would start combat with 3x Ctrl")
+                        sleep(INITIAL_ATTACK_DELAY)
 
+                if zone_detection_allowed('crop_enemy_hp'):
                     enemy_hp_frame = wincap.get_screenshot(GAME_WINDOW_TITLE, 'crop_enemy_hp')
-                    rectangles_enemy_hp_damaged = vision_enemy_hp_damaged.find(enemy_hp_frame, current_thresholds['HP_DAMAGED'])
-                    rectangles_enemy_hp_empty = vision_enemy_hp_empty.find(enemy_hp_frame, current_thresholds['HP_EMPTY'])
+                    rectangles_enemy_hp_damaged = vision_enemy_hp_damaged.find(enemy_hp_frame, current_threshold_hp_damaged)
+                    rectangles_enemy_hp_empty = vision_enemy_hp_empty.find(enemy_hp_frame, current_threshold_hp_empty)
+                else:
+                    rectangles_enemy_hp_damaged = np.empty((0,), dtype=np.float32)
+                    rectangles_enemy_hp_empty = np.empty((0,), dtype=np.float32)
 
-                    if rectangles_enemy_hp_damaged.any():
-                        # Only log attack message once per enemy
-                        if not attacking_logged:
-                            notify("status", "🗡️ Enemy damaged, attacking (2x Ctrl).")
-                            attacking_logged = True
+                if rectangles_enemy_hp_damaged.any():
+                    if not attacking_logged:
+                        if actions_enabled():
+                            notify("status", "Enemy damaged; continuing attacks (2x Ctrl).")
+                        else:
+                            notify("status", "[DRY RUN] Would continue attacking with 2x Ctrl")
+                        attacking_logged = True
+                    if actions_enabled():
                         press_ctrl()
                         press_ctrl()
-                        sleep(attack_delay.value)
+                    else:
+                        pass  # Already logged above on first iteration
+                    sleep(attack_delay.value)
 
-            except Exception as e:
-                notify("error", f"❌ Bot loop error: {e}")
-                continue
+            if manual_capture_trigger is not None:
+                try:
+                    manual_value = manual_capture_trigger.value
+                except Exception:
+                    manual_value = last_manual_capture
+                if manual_value != last_manual_capture:
+                    last_manual_capture = manual_value
+                    notify("status", "Manual debug capture requested.")
+                    if open_loot_frame is not None:
+                        capture_debug('open_loot', open_loot_frame, template_open_loot, current_threshold_open)
+                    if loot_frame is not None:
+                        capture_debug('loot_window', loot_frame, template_loot_window, current_threshold_loot)
+                    if enemy_hp_frame is not None:
+                        capture_debug('hp_full', enemy_hp_frame, template_hp_full, current_threshold_hp_full)
 
-        else:
-            game_closed()
+    except Exception as exc:
+        notify("error", f"Bot loop terminated due to error: {exc}")
+    finally:
+        if overlay_enabled is not None and overlay_thread is not None:
+            overlay_stop_event.set()
+            overlay_thread.join(timeout=1.0)
 
-        if cv2.waitKey(1) == ord('q'):
-            cv2.destroyAllWindows()
-            break
-
-    # Clean up overlay thread
-    if overlay_enabled and overlay_thread:
-        overlay_stop_event.set()
-        overlay_thread.join(timeout=1.0)
-        notify("status", "✅ Overlay thread stopped")
+        with started.get_lock():
+            started.value = False

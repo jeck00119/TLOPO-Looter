@@ -5,6 +5,9 @@ import sys
 import threading
 from datetime import datetime
 
+import cv2
+import numpy as np
+
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
     from PyQt5.QtGui import QMovie, QIcon
@@ -218,334 +221,780 @@ QTextBrowser:focus {
 }
 """
 
+_shared_manager = None
+
+
+def _get_shared_manager():
+    """Lazy-create a single multiprocessing.Manager instance for shared overlay state."""
+    global _shared_manager
+    if _shared_manager is None:
+        _shared_manager = multiprocessing.Manager()
+    return _shared_manager
+
 
 class DetectionOverlayWindow(QtWidgets.QWidget):
     """
-    Window that displays the game window with detection zones overlaid.
-    Green rectangles = detection found
-    Red rectangles = no detection
+    Debug overlay window that visualizes detection zones and allows manual adjustment.
     """
-    def __init__(self, parent=None, log_callback=None):
+
+    def __init__(self, parent=None, log_callback=None, update_callback=None):
         super().__init__(parent)
-        self.setWindowTitle("TLOPO Looter - Detection Overlay [Position: 0, 0]")
+        self.setWindowTitle("TLOPO Looter - Detection Overlay")
         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
+        self.setMouseTracking(True)
 
-        # Store latest detection data
-        self.game_image = None
-        self.detection_zones = {}  # {zone_name: {'x': x, 'y': y, 'w': w, 'h': h, 'detected': bool}}
-        self.zone_offsets = {}  # {zone_name: {'dx': 0, 'dy': 0}} - manual adjustments
-
-        # Click visualization
-        self.click_positions = []  # List of {'x': x, 'y': y, 'label': label, 'color': (r,g,b)}
-
-        # Position tracking
-        self.offset_x = 0
-        self.offset_y = 0
         self.log_callback = log_callback
+        self.update_callback = update_callback
 
-        # Dragging state
+        self.info_label = QtWidgets.QLabel("Drag zones | P: save | R: reset | C: clear clicks")
+        self.info_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.info_label.setStyleSheet("background-color: #222222; color: #00FF00; padding: 5px; font-weight: bold;")
+
+        self.image_label = QtWidgets.QLabel()
+        self.image_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self.image_label.setStyleSheet("background-color: #000000;")
+        self.image_label.setMouseTracking(True)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.info_label)
+        layout.addWidget(self.image_label)
+        self.setLayout(layout)
+
+        # Stored state
+        self.base_image = None  # QtGui.QImage
+        self.current_pixmap = None
+        self.detection_zones = {}  # zone_name -> dict
+        self.zone_offsets = {}  # zone_name -> {'dx': int, 'dy': int}
+        self.click_positions = []  # list of dicts with x, y, label, color
+
+        # Interaction tracking
         self.dragging_zone = None
         self.drag_start_pos = None
         self.drag_start_zone_pos = None
+        self.drag_start_zone_data = None  # Immutable snapshot of zone data at drag start
 
-        # Resolution info (set externally)
+        # Interaction mode and resize tracking
+        self.interaction_mode = "move"  # "move" or "resize"
+        self.zone_size_changes = {}  # zone_name -> {'dw': int, 'dh': int}
+        self.zone_min_sizes = {}  # zone_name -> {'w': int, 'h': int}
+        self.resizing_zone = None
+        self.resize_start_pos = None
+        self.resize_start_size = None
+        self.resize_start_offset = None  # Store starting offset for left/top edge resizing
+        self.resize_start_zone_data = None  # Immutable snapshot of zone data at resize start
+        self.resize_type = None  # "corner", "right", "bottom", or None
+
+        # Resize constraints
+        self.MIN_ZONE_WIDTH = 2
+        self.MIN_ZONE_HEIGHT = 2
+        self.RESIZE_EDGE_MARGIN = 8  # pixels from edge to trigger edge resize
+        self.RESIZE_CORNER_SIZE = 16  # corner region size (takes priority)
+
+        # Metadata
         self.resolution = "Unknown"
         self.scale_x = 1.0
         self.scale_y = 1.0
         self.border_offset = (0, 0)
 
-        # Create display label
-        self.image_label = QtWidgets.QLabel()
-        self.image_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.image_label.setStyleSheet("background-color: #000000;")
-        self.image_label.setMouseTracking(True)
+        # Persistent zone storage (for restoring custom zones across updates)
+        self.overlay_last_regions = None
 
-        # Info label at top for instructions
-        self.info_label = QtWidgets.QLabel("Drag zones | P: save | R: reset | C: clear clicks")
-        self.info_label.setStyleSheet("background-color: #222222; color: #00FF00; padding: 5px; font-weight: bold;")
-        self.info_label.setAlignment(QtCore.Qt.AlignCenter)
+        # Initialize mode label
+        self._update_mode_label()
 
-        # Layout
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.info_label)
-        layout.addWidget(self.image_label)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(layout)
-
-        # Initial size
-        self.resize(800, 600)
-
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def set_resolution_info(self, resolution, scale_x, scale_y, border_offset):
-        """Set resolution info for debugging"""
-        self.resolution = resolution
-        self.scale_x = scale_x
-        self.scale_y = scale_y
-        self.border_offset = border_offset
+        self.resolution = resolution or "Unknown"
+        self.scale_x = float(scale_x)
+        self.scale_y = float(scale_y)
+        self.border_offset = tuple(border_offset) if border_offset else (0, 0)
 
-    def reset_offsets(self):
-        """Reset all manual zone offsets to default"""
-        self.zone_offsets = {}
-        if self.log_callback:
-            self.log_callback("🔄 Overlay zones reset to default positions")
-        # Redraw with reset positions
-        if self.game_image is not None and self.detection_zones:
-            self.update_detection_data(self.game_image, self.detection_zones)
+    def update_detection_data(self, image_bytes, width, height, zones):
+        if not image_bytes or width <= 0 or height <= 0:
+            return
+
+        try:
+            bytes_per_line = width * 3
+            qimage = QtGui.QImage(image_bytes, width, height, bytes_per_line, QtGui.QImage.Format_BGR888)
+            self.base_image = qimage.copy()
+
+            # Expand/refresh detection zones dictionary
+            new_zones = {}
+            min_sizes = {}
+            for zone in zones or []:
+                name = zone.get("name")
+                if not name:
+                    continue
+                new_zones[name] = {
+                    "x": int(zone.get("x", 0)),
+                    "y": int(zone.get("y", 0)),
+                    "w": int(zone.get("w", 0)),
+                    "h": int(zone.get("h", 0)),
+                    "detected": bool(zone.get("detected", False)),
+                }
+                min_w = int(zone.get("min_w", new_zones[name]["w"]))
+                min_h = int(zone.get("min_h", new_zones[name]["h"]))
+                min_sizes[name] = {
+                    "w": max(self.MIN_ZONE_WIDTH, min_w),
+                    "h": max(self.MIN_ZONE_HEIGHT, min_h),
+                }
+
+                # Skip updating offsets/sizes for zones currently being manipulated
+                # This prevents incoming data from interfering with user drag/resize operations
+                if name == self.dragging_zone or name == self.resizing_zone:
+                    # Keep existing offsets and sizes, don't reset them
+                    self.zone_offsets.setdefault(name, {"dx": 0, "dy": 0})
+                    self.zone_size_changes.setdefault(name, {"dw": 0, "dh": 0})
+                    continue
+
+                need_offsets = name not in self.zone_offsets
+                need_sizes = name not in self.zone_size_changes
+                desired = None
+
+                if (need_offsets or need_sizes) and self.overlay_last_regions:
+                    desired = self.overlay_last_regions.get(name)
+
+                if need_offsets or need_sizes:
+                    if desired:
+                        dx = int(desired.get("x", new_zones[name]["x"])) - new_zones[name]["x"]
+                        dy = int(desired.get("y", new_zones[name]["y"])) - new_zones[name]["y"]
+                        dw = int(desired.get("w", new_zones[name]["w"])) - new_zones[name]["w"]
+                        dh = int(desired.get("h", new_zones[name]["h"])) - new_zones[name]["h"]
+                        self.zone_offsets[name] = {"dx": dx, "dy": dy}
+                        self.zone_size_changes[name] = {"dw": dw, "dh": dh}
+                    else:
+                        self.zone_offsets.setdefault(name, {"dx": 0, "dy": 0})
+                        self.zone_size_changes.setdefault(name, {"dw": 0, "dh": 0})
+                else:
+                    self.zone_offsets.setdefault(name, {"dx": 0, "dy": 0})
+                    self.zone_size_changes.setdefault(name, {"dw": 0, "dh": 0})
+
+            self.detection_zones = new_zones
+            self.zone_min_sizes = min_sizes
+
+            # Remove stale offsets for zones no longer present
+            # BUT: Don't remove offsets for zones currently being dragged/resized
+            for name in list(self.zone_offsets.keys()):
+                if name not in self.detection_zones:
+                    # Protect zones being actively manipulated
+                    if name == self.dragging_zone or name == self.resizing_zone:
+                        continue  # Keep offsets for zone being interacted with
+                    self.zone_offsets.pop(name, None)
+                    self.zone_size_changes.pop(name, None)
+
+            # Resize label to match raw image size for accurate dragging
+            self.image_label.setFixedSize(width, height)
+            self._render_overlay()
+
+        except Exception as e:
+            # Prevent overlay crashes from taking down the entire app
+            if self.log_callback:
+                self.log_callback(f"Overlay update error: {e}")
+            # Keep the overlay functional even if one update fails
+            pass
 
     def add_click(self, x, y, label="Click", color=(255, 255, 0)):
-        """Add a click position to visualize"""
-        self.click_positions.append({'x': x, 'y': y, 'label': label, 'color': color})
+        if x is None or y is None:
+            return
+        try:
+            cx = int(x)
+            cy = int(y)
+        except Exception:
+            return
+
+        if isinstance(color, (list, tuple)) and len(color) >= 3:
+            color_value = tuple(int(c) for c in color[:3])
+        else:
+            color_value = (255, 255, 0)
+
+        self.click_positions.append({
+            "x": cx,
+            "y": cy,
+            "label": label,
+            "color": color_value,
+        })
+        if len(self.click_positions) > 100:
+            self.click_positions = self.click_positions[-100:]
+        self._render_overlay()
 
     def clear_clicks(self):
-        """Clear all click visualizations"""
-        self.click_positions = []
+        self.click_positions.clear()
         if self.log_callback:
-            self.log_callback("🧹 Cleared click visualizations")
+            self.log_callback("Cleared overlay click markers.")
+        self._render_overlay()
 
+    def reset_offsets(self):
+        self.zone_offsets = {name: {"dx": 0, "dy": 0} for name in self.detection_zones}
+        self.zone_size_changes = {name: {"dw": 0, "dh": 0} for name in self.detection_zones}
+        if self.log_callback:
+            self.log_callback("Overlay zones reset to default positions and sizes.")
+        self._render_overlay()
+        self._emit_zone_update()
+
+    def get_adjusted_regions(self):
+        if not self.detection_zones:
+            return None
+        adjusted = {}
+        for name, zone in self.detection_zones.items():
+            offset = self.zone_offsets.get(name, {"dx": 0, "dy": 0})
+            size_change = self.zone_size_changes.get(name, {"dw": 0, "dh": 0})
+            min_w, min_h = self._get_zone_min_size(name)
+            adjusted[name] = {
+                "x": zone["x"] + offset["dx"],
+                "y": zone["y"] + offset["dy"],
+                "w": max(min_w, zone["w"] + size_change["dw"]),
+                "h": max(min_h, zone["h"] + size_change["dh"]),
+            }
+        return adjusted
+
+    def _emit_zone_update(self):
+        if self.update_callback:
+            try:
+                adjusted = self.get_adjusted_regions()
+                # Store adjusted regions to enable restoration if bot sends stale data
+                # during the async update propagation delay (~15-50ms)
+                # This prevents zones from resetting to base position during the update window
+                if adjusted:
+                    self.overlay_last_regions = {
+                        name: dict(values) for name, values in adjusted.items()
+                    }
+                self.update_callback(adjusted)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Internal rendering helpers
+    # ------------------------------------------------------------------
+    def _render_overlay(self):
+        if self.base_image is None:
+            return
+
+        pixmap = QtGui.QPixmap.fromImage(self.base_image)
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        font = painter.font()
+        font.setPointSize(10)
+        painter.setFont(font)
+
+        for zone_name, zone_data in self.detection_zones.items():
+            offset = self.zone_offsets.get(zone_name, {"dx": 0, "dy": 0})
+            size_change = self.zone_size_changes.get(zone_name, {"dw": 0, "dh": 0})
+
+            x = zone_data["x"] + offset["dx"]
+            y = zone_data["y"] + offset["dy"]
+            w = zone_data["w"] + size_change["dw"]
+            h = zone_data["h"] + size_change["dh"]
+            detected = zone_data["detected"]
+
+            # Draw rectangle
+            pen = QtGui.QPen(QtGui.QColor(0, 255, 0) if detected else QtGui.QColor(255, 0, 0))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawRect(x, y, w, h)
+
+            # Draw resize indicator in resize mode
+            if self.interaction_mode == "resize":
+                # Draw small corner handle indicator
+                handle_size = 6
+                painter.fillRect(
+                    x + w - handle_size,
+                    y + h - handle_size,
+                    handle_size,
+                    handle_size,
+                    QtGui.QColor(255, 165, 0)  # Orange
+                )
+
+            # Draw label with size info
+            text_bg = QtGui.QColor(0, 0, 0, 160)
+            label_text = f"{zone_name} [{w}x{h}]"
+            label_width = int(painter.fontMetrics().horizontalAdvance(label_text) + 6)
+            painter.fillRect(x, y - 18, label_width, 18, text_bg)
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255)))
+            painter.drawText(x + 3, y - 4, label_text)
+
+        for click in self.click_positions:
+            cx = click["x"]
+            cy = click["y"]
+            color = click.get("color", (255, 255, 0))
+            label = click.get("label", "Click")
+
+            pen = QtGui.QPen(QtGui.QColor(*color))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            brush = QtGui.QBrush(QtGui.QColor(color[0], color[1], color[2], 80))
+            painter.setBrush(brush)
+            painter.drawEllipse(QtCore.QPoint(cx, cy), 6, 6)
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255)))
+            painter.drawText(cx + 8, cy + 4, label)
+
+        painter.end()
+
+        self.current_pixmap = pixmap
+        self.image_label.setPixmap(pixmap)
+
+    def _update_mode_label(self):
+        """Update info label to show current mode"""
+        mode_text = "MOVE" if self.interaction_mode == "move" else "RESIZE"
+        color = "#00FF00" if self.interaction_mode == "move" else "#FFA500"
+        self.info_label.setText(
+            f"Mode: <span style='color: {color}; font-weight: bold;'>{mode_text}</span> | "
+            f"Right-click: change mode | P: save | R: reset | C: clear clicks"
+        )
+
+    def _get_zone_min_size(self, zone_name):
+        minima = self.zone_min_sizes.get(zone_name) or {}
+        min_w = max(self.MIN_ZONE_WIDTH, int(minima.get("w", self.MIN_ZONE_WIDTH)))
+        min_h = max(self.MIN_ZONE_HEIGHT, int(minima.get("h", self.MIN_ZONE_HEIGHT)))
+        return min_w, min_h
+
+    def _detect_resize_region(self, click_x, click_y, zone_x, zone_y, zone_w, zone_h):
+        """
+        Determines which resize region was clicked.
+
+        Args:
+            click_x, click_y: Mouse click position
+            zone_x, zone_y, zone_w, zone_h: Zone boundaries
+
+        Returns:
+            "top_left", "top_right", "bottom_left", "bottom_right" - Corner resize
+            "left", "right", "top", "bottom" - Edge resize
+            None - Interior or outside (no resize)
+        """
+        # Calculate distances from all 4 edges
+        dist_from_left = abs(click_x - zone_x)
+        dist_from_right = abs(click_x - (zone_x + zone_w))
+        dist_from_top = abs(click_y - zone_y)
+        dist_from_bottom = abs(click_y - (zone_y + zone_h))
+
+        # Check all 4 corners first (highest priority, larger hit area)
+        if dist_from_left <= self.RESIZE_CORNER_SIZE and dist_from_top <= self.RESIZE_CORNER_SIZE:
+            return "top_left"
+        if dist_from_right <= self.RESIZE_CORNER_SIZE and dist_from_top <= self.RESIZE_CORNER_SIZE:
+            return "top_right"
+        if dist_from_left <= self.RESIZE_CORNER_SIZE and dist_from_bottom <= self.RESIZE_CORNER_SIZE:
+            return "bottom_left"
+        if dist_from_right <= self.RESIZE_CORNER_SIZE and dist_from_bottom <= self.RESIZE_CORNER_SIZE:
+            return "bottom_right"
+
+        # Check all 4 edges (must be within bounds of zone perpendicular to edge)
+        if dist_from_left <= self.RESIZE_EDGE_MARGIN and zone_y <= click_y <= zone_y + zone_h:
+            return "left"
+        if dist_from_right <= self.RESIZE_EDGE_MARGIN and zone_y <= click_y <= zone_y + zone_h:
+            return "right"
+        if dist_from_top <= self.RESIZE_EDGE_MARGIN and zone_x <= click_x <= zone_x + zone_w:
+            return "top"
+        if dist_from_bottom <= self.RESIZE_EDGE_MARGIN and zone_x <= click_x <= zone_x + zone_w:
+            return "bottom"
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
     def mousePressEvent(self, event):
-        """Start dragging a zone"""
         if event.button() == QtCore.Qt.LeftButton:
-            # Check if click is inside any zone
-            click_pos = event.pos()
-            # Account for info label height
-            click_y = click_pos.y() - self.info_label.height()
+            click_x = event.pos().x()
+            click_y = event.pos().y() - self.info_label.height()
+            if 0 <= click_y <= self.image_label.height() and 0 <= click_x <= self.image_label.width():
+                for zone_name, zone_data in self.detection_zones.items():
+                    offset = self.zone_offsets.get(zone_name, {"dx": 0, "dy": 0})
+                    size_change = self.zone_size_changes.get(zone_name, {"dw": 0, "dh": 0})
+                    x = zone_data["x"] + offset["dx"]
+                    y = zone_data["y"] + offset["dy"]
+                    w = zone_data["w"] + size_change["dw"]
+                    h = zone_data["h"] + size_change["dh"]
 
-            for zone_name, zone_data in self.detection_zones.items():
-                offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
-                x = zone_data.get('x', 0) + offset['dx']
-                y = zone_data.get('y', 0) + offset['dy']
-                w = zone_data.get('w', 0)
-                h = zone_data.get('h', 0)
+                    if x <= click_x <= x + w and y <= click_y <= y + h:
+                        if self.interaction_mode == "move":
+                            self.dragging_zone = zone_name
+                            self.drag_start_pos = QtCore.QPoint(event.pos())
+                            self.drag_start_zone_pos = QtCore.QPoint(x, y)
+                            self.drag_start_zone_data = zone_data.copy()  # Snapshot zone data to prevent drift
+                            self.setCursor(QtCore.Qt.ClosedHandCursor)
+                        else:  # resize mode
+                            # Detect which resize region was clicked
+                            resize_region = self._detect_resize_region(click_x, click_y, x, y, w, h)
+                            if resize_region:
+                                self.resizing_zone = zone_name
+                                self.resize_start_pos = QtCore.QPoint(event.pos())
+                                self.resize_start_size = QtCore.QSize(w, h)
+                                self.resize_start_offset = offset.copy()  # Store starting offset for left/top edge resizing
+                                self.resize_start_zone_data = zone_data.copy()  # Snapshot zone data to prevent drift
+                                self.resize_type = resize_region
 
-                if x <= click_pos.x() <= x + w and y <= click_y <= y + h:
-                    self.dragging_zone = zone_name
-                    self.drag_start_pos = click_pos
-                    self.drag_start_zone_pos = (x, y)
-                    self.setCursor(QtCore.Qt.ClosedHandCursor)
-                    break
+                                # Set cursor based on resize type
+                                cursor_map = {
+                                    "top_left": QtCore.Qt.SizeFDiagCursor,
+                                    "bottom_right": QtCore.Qt.SizeFDiagCursor,
+                                    "top_right": QtCore.Qt.SizeBDiagCursor,
+                                    "bottom_left": QtCore.Qt.SizeBDiagCursor,
+                                    "left": QtCore.Qt.SizeHorCursor,
+                                    "right": QtCore.Qt.SizeHorCursor,
+                                    "top": QtCore.Qt.SizeVerCursor,
+                                    "bottom": QtCore.Qt.SizeVerCursor,
+                                }
+                                self.setCursor(cursor_map.get(resize_region, QtCore.Qt.ArrowCursor))
+                        break
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        """Update zone position while dragging"""
         if self.dragging_zone and self.drag_start_pos:
+            # Move mode
             delta_x = event.pos().x() - self.drag_start_pos.x()
             delta_y = event.pos().y() - self.drag_start_pos.y()
+            original = self.drag_start_zone_data  # Use snapshot instead of live data
+            start_x = self.drag_start_zone_pos.x()
+            start_y = self.drag_start_zone_pos.y()
 
-            # Update zone offset
-            if self.dragging_zone not in self.zone_offsets:
-                self.zone_offsets[self.dragging_zone] = {'dx': 0, 'dy': 0}
+            new_x = start_x + delta_x
+            new_y = start_y + delta_y
 
-            original_x = self.detection_zones[self.dragging_zone].get('x', 0)
-            original_y = self.detection_zones[self.dragging_zone].get('y', 0)
-            new_x = self.drag_start_zone_pos[0] + delta_x
-            new_y = self.drag_start_zone_pos[1] + delta_y
+            self.zone_offsets[self.dragging_zone]["dx"] = new_x - original["x"]
+            self.zone_offsets[self.dragging_zone]["dy"] = new_y - original["y"]
 
-            self.zone_offsets[self.dragging_zone]['dx'] = new_x - original_x
-            self.zone_offsets[self.dragging_zone]['dy'] = new_y - original_y
+            self._render_overlay()
 
-            # Redraw
-            self.update_detection_data(self.game_image, self.detection_zones)
+        elif self.resizing_zone and self.resize_start_pos:
+            # Resize mode
+            delta_x = event.pos().x() - self.resize_start_pos.x()
+            delta_y = event.pos().y() - self.resize_start_pos.y()
+
+            original = self.resize_start_zone_data  # Use snapshot instead of live data
+            start_w = self.resize_start_size.width()
+            start_h = self.resize_start_size.height()
+            start_offset = self.resize_start_offset
+            min_w, min_h = self._get_zone_min_size(self.resizing_zone)
+
+            # Calculate new dimensions and offsets based on resize type
+            if self.resize_type == "bottom_right":
+                # Bottom-right corner: resize width and height (right and bottom edges move)
+                new_w = max(min_w, start_w + delta_x)
+                new_h = max(min_h, start_h + delta_y)
+                new_offset_dx = start_offset["dx"]
+                new_offset_dy = start_offset["dy"]
+
+            elif self.resize_type == "right":
+                # Right edge: resize width only
+                new_w = max(min_w, start_w + delta_x)
+                new_h = start_h
+                new_offset_dx = start_offset["dx"]
+                new_offset_dy = start_offset["dy"]
+
+            elif self.resize_type == "bottom":
+                # Bottom edge: resize height only
+                new_w = start_w
+                new_h = max(min_h, start_h + delta_y)
+                new_offset_dx = start_offset["dx"]
+                new_offset_dy = start_offset["dy"]
+
+            elif self.resize_type == "left":
+                # Left edge: move left edge, keep right edge fixed
+                new_w = max(min_w, start_w - delta_x)
+                new_h = start_h
+                new_offset_dx = start_offset["dx"] + start_w - new_w
+                new_offset_dy = start_offset["dy"]
+
+            elif self.resize_type == "top":
+                # Top edge: move top edge, keep bottom edge fixed
+                new_w = start_w
+                new_h = max(min_h, start_h - delta_y)
+                new_offset_dx = start_offset["dx"]
+                new_offset_dy = start_offset["dy"] + start_h - new_h
+
+            elif self.resize_type == "top_left":
+                # Top-left corner: move top and left edges
+                new_w = max(min_w, start_w - delta_x)
+                new_h = max(min_h, start_h - delta_y)
+                new_offset_dx = start_offset["dx"] + start_w - new_w
+                new_offset_dy = start_offset["dy"] + start_h - new_h
+
+            elif self.resize_type == "top_right":
+                # Top-right corner: move top edge, resize width
+                new_w = max(min_w, start_w + delta_x)
+                new_h = max(min_h, start_h - delta_y)
+                new_offset_dx = start_offset["dx"]
+                new_offset_dy = start_offset["dy"] + start_h - new_h
+
+            elif self.resize_type == "bottom_left":
+                # Bottom-left corner: move left edge, resize height
+                new_w = max(min_w, start_w - delta_x)
+                new_h = max(min_h, start_h + delta_y)
+                new_offset_dx = start_offset["dx"] + start_w - new_w
+                new_offset_dy = start_offset["dy"]
+
+            else:
+                # Fallback (shouldn't happen)
+                new_w = start_w
+                new_h = start_h
+                new_offset_dx = start_offset["dx"]
+                new_offset_dy = start_offset["dy"]
+
+            # Apply window bounds constraint
+            zone_x = original["x"] + new_offset_dx
+            zone_y = original["y"] + new_offset_dy
+
+            # Ensure zone stays within image bounds
+            if zone_x < 0:
+                new_offset_dx -= zone_x
+                zone_x = 0
+            if zone_y < 0:
+                new_offset_dy -= zone_y
+                zone_y = 0
+
+            max_w = self.image_label.width() - zone_x
+            max_h = self.image_label.height() - zone_y
+            new_w = max(min_w, min(new_w, max_w))
+            new_h = max(min_h, min(new_h, max_h))
+
+            if self.resize_type in ("left", "top_left", "bottom_left"):
+                new_offset_dx = start_offset["dx"] + start_w - new_w
+            if self.resize_type in ("top", "top_left", "top_right"):
+                new_offset_dy = start_offset["dy"] + start_h - new_h
+
+            # Store offset and size changes
+            self.zone_offsets[self.resizing_zone]["dx"] = new_offset_dx
+            self.zone_offsets[self.resizing_zone]["dy"] = new_offset_dy
+            self.zone_size_changes[self.resizing_zone]["dw"] = new_w - original["w"]
+            self.zone_size_changes[self.resizing_zone]["dh"] = new_h - original["h"]
+
+            self._render_overlay()
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        """Stop dragging"""
         if event.button() == QtCore.Qt.LeftButton:
+            if self.dragging_zone:
+                # Move mode release
+                if self.log_callback:
+                    offset = self.zone_offsets[self.dragging_zone]
+                    self.log_callback(
+                        f"{self.dragging_zone} moved: offset dx={offset['dx']}, dy={offset['dy']}"
+                    )
+                self._emit_zone_update()
+                # Clear offsets - they're now baked into the base position sent to bot
+                # This prevents feedback loop where old offsets get applied to new base
+                self.zone_offsets[self.dragging_zone] = {"dx": 0, "dy": 0}
+                self.dragging_zone = None
+                self.drag_start_pos = None
+                self.drag_start_zone_pos = None
+                self.drag_start_zone_data = None  # Clear snapshot
+                self.setCursor(QtCore.Qt.ArrowCursor)
+
+            elif self.resizing_zone:
+                # Resize mode release
+                if self.log_callback:
+                    size_change = self.zone_size_changes[self.resizing_zone]
+                    zone = self.detection_zones[self.resizing_zone]
+                    final_w = zone["w"] + size_change["dw"]
+                    final_h = zone["h"] + size_change["dh"]
+                    resize_type_text = f" [{self.resize_type}]" if self.resize_type else ""
+                    self.log_callback(
+                        f"{self.resizing_zone} resized{resize_type_text}: {zone['w']}x{zone['h']} -> {final_w}x{final_h} "
+                        f"(dw={size_change['dw']}, dh={size_change['dh']})"
+                    )
+                self._emit_zone_update()
+                # Clear size changes - they're now baked into the base size sent to bot
+                # This prevents feedback loop where old size changes get applied to new base
+                self.zone_size_changes[self.resizing_zone] = {"dw": 0, "dh": 0}
+                # Also clear offsets in case resize affected position (left/top edges)
+                self.zone_offsets[self.resizing_zone] = {"dx": 0, "dy": 0}
+                self.resizing_zone = None
+                self.resize_start_pos = None
+                self.resize_start_size = None
+                self.resize_start_zone_data = None  # Clear snapshot
+                self.resize_type = None
+                self.setCursor(QtCore.Qt.ArrowCursor)
+
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        """Handle mouse leaving widget - cancel any active drag/resize"""
+        # If mouse leaves the overlay window while dragging, stop the operation
+        # This prevents "stuck" drags where release event isn't captured
+        if self.dragging_zone or self.resizing_zone:
+            if self.log_callback:
+                self.log_callback("Mouse left overlay area - cancelling drag/resize operation")
+
+            # Clear all drag/resize state
             self.dragging_zone = None
             self.drag_start_pos = None
             self.drag_start_zone_pos = None
+            self.drag_start_zone_data = None  # Clear snapshot
+            self.resizing_zone = None
+            self.resize_start_pos = None
+            self.resize_start_size = None
+            self.resize_start_offset = None
+            self.resize_start_zone_data = None  # Clear snapshot
+            self.resize_type = None
             self.setCursor(QtCore.Qt.ArrowCursor)
-        super().mouseReleaseEvent(event)
+
+        super().leaveEvent(event)
 
     def keyPressEvent(self, event):
-        """Handle keyboard shortcuts"""
         if event.key() == QtCore.Qt.Key_P:
-            # Save all debug info to file
             self._save_debug_file()
+        elif event.key() == QtCore.Qt.Key_S:
+            self._save_screenshot()
         elif event.key() == QtCore.Qt.Key_R:
-            # Reset all zone offsets to default
             self.reset_offsets()
         elif event.key() == QtCore.Qt.Key_C:
-            # Clear click visualizations
             self.clear_clicks()
         super().keyPressEvent(event)
 
+    def contextMenuEvent(self, event):
+        """Show context menu for mode selection"""
+        click_x = event.pos().x()
+        click_y = event.pos().y() - self.info_label.height()
+
+        # Check if click is on a zone
+        zone_under_cursor = None
+        if 0 <= click_y <= self.image_label.height() and 0 <= click_x <= self.image_label.width():
+            for zone_name, zone_data in self.detection_zones.items():
+                offset = self.zone_offsets.get(zone_name, {"dx": 0, "dy": 0})
+                size_change = self.zone_size_changes.get(zone_name, {"dw": 0, "dh": 0})
+                x = zone_data["x"] + offset["dx"]
+                y = zone_data["y"] + offset["dy"]
+                w = zone_data["w"] + size_change["dw"]
+                h = zone_data["h"] + size_change["dh"]
+
+                if x <= click_x <= x + w and y <= click_y <= y + h:
+                    zone_under_cursor = zone_name
+                    break
+
+        menu = QtWidgets.QMenu(self)
+
+        # Mode selection
+        move_label = "[*] Move Mode" if self.interaction_mode == "move" else "Move Mode"
+        resize_label = "[*] Resize Mode" if self.interaction_mode == "resize" else "Resize Mode"
+        move_action = menu.addAction(move_label)
+        resize_action = menu.addAction(resize_label)
+
+        if zone_under_cursor:
+            menu.addSeparator()
+            reset_zone_action = menu.addAction(f"Reset '{zone_under_cursor}'")
+        else:
+            reset_zone_action = None
+
+        action = menu.exec_(event.globalPos())
+
+        if action == move_action:
+            self.interaction_mode = "move"
+            self._update_mode_label()
+            self._render_overlay()  # Re-render to hide resize handles
+            if self.log_callback:
+                self.log_callback("Switched to Move mode.")
+        elif action == resize_action:
+            self.interaction_mode = "resize"
+            self._update_mode_label()
+            self._render_overlay()  # Re-render to show resize handles
+            if self.log_callback:
+                self.log_callback("Switched to Resize mode.")
+        elif action == reset_zone_action and zone_under_cursor:
+            self.zone_offsets[zone_under_cursor] = {"dx": 0, "dy": 0}
+            self.zone_size_changes[zone_under_cursor] = {"dw": 0, "dh": 0}
+            if self.log_callback:
+                self.log_callback(f"Reset {zone_under_cursor} to defaults.")
+            self._render_overlay()
+            self._emit_zone_update()
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
     def _save_debug_file(self):
-        """Save zone positions and debug info to file"""
+        if not self.detection_zones:
+            if self.log_callback:
+                self.log_callback("No detection zone data available to save.")
+            return
+
         from datetime import datetime
         import os
 
-        if not self.detection_zones:
-            if self.log_callback:
-                self.log_callback("❌ No detection zones data available yet")
-            return
-
-        # Create filename with resolution
-        resolution_safe = self.resolution.replace('x', '_')
+        safe_resolution = self.resolution.replace("x", "_")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"overlay_debug_{resolution_safe}_{timestamp}.txt"
+        filename = f"overlay_debug_{safe_resolution}_{timestamp}.txt"
+        debug_path = bot_logic.get_data_path(filename)
 
-        # Build debug content
         lines = []
-        lines.append("=" * 70)
-        lines.append(f"TLOPO Looter - Detection Overlay Debug Report")
-        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append("=" * 70)
+        lines.append("=" * 72)
+        lines.append("TLOPO Looter - Overlay Debug Snapshot")
+        lines.append(f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}")
+        lines.append("=" * 72)
         lines.append("")
-        lines.append("RESOLUTION INFO:")
-        lines.append(f"  Game Resolution: {self.resolution}")
-        lines.append(f"  Scale Factors: X={self.scale_x:.4f}, Y={self.scale_y:.4f}")
-        lines.append(f"  Border Offset: X={self.border_offset[0]}px, Y={self.border_offset[1]}px")
-        lines.append(f"  Overlay Window Position: X={self.offset_x}, Y={self.offset_y}")
+        lines.append(f"Resolution: {self.resolution}")
+        lines.append(f"Scale: X={self.scale_x:.4f}, Y={self.scale_y:.4f}")
+        lines.append(f"Border Offset: {self.border_offset}")
         lines.append("")
-        lines.append("DETECTION ZONES:")
-        lines.append("-" * 70)
+        lines.append("Detection Zones:")
+        lines.append("-" * 72)
 
-        for zone_name, zone_data in self.detection_zones.items():
-            original_x = zone_data.get('x', 0)
-            original_y = zone_data.get('y', 0)
-            w = zone_data.get('w', 0)
-            h = zone_data.get('h', 0)
-            detected = zone_data.get('detected', False)
+        for name, zone in self.detection_zones.items():
+            offset = self.zone_offsets.get(name, {"dx": 0, "dy": 0})
+            size_change = self.zone_size_changes.get(name, {"dw": 0, "dh": 0})
+            adjusted_w = zone['w'] + size_change['dw']
+            adjusted_h = zone['h'] + size_change['dh']
 
-            offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
-            adjusted_x = original_x + offset['dx']
-            adjusted_y = original_y + offset['dy']
+            lines.extend([
+                f"\n{name}:",
+                f"  Base: x={zone['x']}, y={zone['y']}, w={zone['w']}, h={zone['h']}",
+                f"  Offset: dx={offset['dx']}, dy={offset['dy']}",
+                f"  Size Change: dw={size_change['dw']}, dh={size_change['dh']}",
+                f"  Adjusted: x={zone['x'] + offset['dx']}, y={zone['y'] + offset['dy']}, "
+                f"w={adjusted_w}, h={adjusted_h}",
+                f"  Detected: {'YES' if zone['detected'] else 'NO'}",
+            ])
 
-            status = "DETECTED" if detected else "NOT FOUND"
-
-            lines.append(f"\n{zone_name}:")
-            lines.append(f"  Original Position: x={original_x}, y={original_y}")
-            lines.append(f"  Adjusted Position: x={adjusted_x}, y={adjusted_y}")
-            lines.append(f"  Manual Offset: dx={offset['dx']}, dy={offset['dy']}")
-            lines.append(f"  Size: w={w}, h={h}")
-            lines.append(f"  Status: {status}")
-
-        lines.append("")
-        lines.append("=" * 70)
-        lines.append("NOTES:")
-        lines.append("  - Original Position: Calculated by bot based on resolution scaling")
-        lines.append("  - Adjusted Position: After manual dragging in overlay window")
-        lines.append("  - Manual Offset: Difference between original and adjusted")
-        lines.append("=" * 70)
-
-        # Save to file
         try:
-            with open(filename, 'w') as f:
-                f.write('\n'.join(lines))
-
+            with open(debug_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
             if self.log_callback:
-                self.log_callback(f"✅ Debug info saved to: {filename}")
-                self.log_callback(f"📍 Window Position: X={self.offset_x}, Y={self.offset_y}")
-                for zone_name in self.detection_zones.keys():
-                    offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
-                    if offset['dx'] != 0 or offset['dy'] != 0:
-                        self.log_callback(f"  {zone_name}: Offset dx={offset['dx']}, dy={offset['dy']}")
-        except Exception as e:
+                self.log_callback(f"Overlay debug saved to {debug_path}.")
+        except Exception as exc:
             if self.log_callback:
-                self.log_callback(f"❌ Error saving debug file: {e}")
+                self.log_callback(f"Failed to save overlay debug file: {exc}")
 
-    def moveEvent(self, event):
-        """Track position changes and update title"""
-        super().moveEvent(event)
-        pos = self.pos()
-        self.offset_x = pos.x()
-        self.offset_y = pos.y()
-        self.setWindowTitle(f"TLOPO Looter - Detection Overlay [Position: {self.offset_x}, {self.offset_y}]")
-
-    def get_offset(self):
-        """Get current window offset"""
-        return (self.offset_x, self.offset_y)
-
-    def update_detection_data(self, game_image, zones):
-        """
-        Update the overlay with new detection data.
-        Args:
-            game_image: numpy array of game window screenshot (BGR format)
-            zones: dict of {zone_name: {'x': x, 'y': y, 'w': w, 'h': h, 'detected': bool}}
-        """
-        import cv2
-        import numpy as np
-
-        if game_image is None:
+    def _save_screenshot(self):
+        """Save the current overlay view as a screenshot (press 's' key)"""
+        if self.current_pixmap is None or self.current_pixmap.isNull():
+            if self.log_callback:
+                self.log_callback("No overlay frame available to save.")
             return
 
-        # Store zones for position logging
-        self.detection_zones = zones
+        from datetime import datetime
 
-        # Create a copy to draw on
-        overlay_image = game_image.copy()
+        safe_resolution = self.resolution.replace("x", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"overlay_screenshot_{safe_resolution}_{timestamp}.jpg"
+        screenshot_path = bot_logic.get_data_path(filename)
 
-        # Draw rectangles for each detection zone
-        for zone_name, zone_data in zones.items():
-            # Get original position
-            x = zone_data.get('x', 0)
-            y = zone_data.get('y', 0)
-            w = zone_data.get('w', 0)
-            h = zone_data.get('h', 0)
-            detected = zone_data.get('detected', False)
+        try:
+            # Convert QPixmap -> QImage and ensure 24-bit BGR order for OpenCV
+            qimage = self.current_pixmap.toImage().convertToFormat(QtGui.QImage.Format_BGR888)
 
-            # Apply manual offset if dragged
-            offset = self.zone_offsets.get(zone_name, {'dx': 0, 'dy': 0})
-            x += offset['dx']
-            y += offset['dy']
+            width = qimage.width()
+            height = qimage.height()
+            bytes_per_line = qimage.bytesPerLine()
 
-            # Choose color: Green if detected, Red if not
-            color = (0, 255, 0) if detected else (0, 0, 255)  # BGR format
+            ptr = qimage.bits()
+            ptr.setsize(bytes_per_line * height)
 
-            # Draw rectangle (thicker if manually adjusted)
-            thickness = 3 if (offset['dx'] != 0 or offset['dy'] != 0) else 2
-            cv2.rectangle(overlay_image, (x, y), (x + w, y + h), color, thickness)
+            # Convert QImage -> numpy array while respecting stride
+            arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, bytes_per_line // 3, 3))
+            if bytes_per_line != width * 3:
+                arr = arr[:, :width, :]
+            arr = np.ascontiguousarray(arr)
 
-            # Draw label with background
-            label = f"{zone_name}: {'DETECTED' if detected else 'NOT FOUND'}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
-            thickness = 1
-            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            # Save using OpenCV
+            cv2.imwrite(screenshot_path, arr)
 
-            # Draw background rectangle for text
-            cv2.rectangle(overlay_image, (x, y - text_height - 10), (x + text_width + 10, y), color, -1)
-
-            # Draw text
-            text_color = (255, 255, 255)  # White text
-            cv2.putText(overlay_image, label, (x + 5, y - 5), font, font_scale, text_color, thickness)
-
-        # Draw click visualizations
-        for click in self.click_positions:
-            click_x = click['x']
-            click_y = click['y']
-            click_label = click['label']
-            click_color = click['color']  # RGB format, need to convert to BGR
-
-            # Convert RGB to BGR for OpenCV
-            bgr_color = (click_color[2], click_color[1], click_color[0])
-
-            # Draw filled circle for click position
-            cv2.circle(overlay_image, (click_x, click_y), 8, bgr_color, -1)
-            # Draw outline
-            cv2.circle(overlay_image, (click_x, click_y), 8, (255, 255, 255), 2)
-
-            # Draw small label next to click
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.4
-            thickness = 1
-            text_offset_x = click_x + 12
-            text_offset_y = click_y + 5
-            cv2.putText(overlay_image, click_label, (text_offset_x, text_offset_y),
-                       font, font_scale, (255, 255, 255), thickness)
-
-        # Convert BGR to RGB for Qt
-        rgb_image = cv2.cvtColor(overlay_image, cv2.COLOR_BGR2RGB)
-
-        # Convert to QImage
-        height, width, channel = rgb_image.shape
-        bytes_per_line = 3 * width
-        q_image = QtGui.QImage(rgb_image.data, width, height, bytes_per_line, QtGui.QImage.Format_RGB888)
-
-        # Update label
-        pixmap = QtGui.QPixmap.fromImage(q_image)
-        self.image_label.setPixmap(pixmap)
-        self.resize(width, height)
-
+            if self.log_callback:
+                self.log_callback(f"Screenshot saved to {screenshot_path}.")
+        except Exception as exc:
+            if self.log_callback:
+                self.log_callback(f"Failed to save screenshot: {exc}")
 
 class BotWindow(QtWidgets.QMainWindow):
     STATUS_POLL_INTERVAL_MS = 500
@@ -559,26 +1008,51 @@ class BotWindow(QtWidgets.QMainWindow):
         self.loot_opened = shared_state["loot_opened"]
         self.legendaries = shared_state["legendaries"]
         self.screenshot_enabled = shared_state["screenshot_enabled"]
-        # Template matching thresholds
+
+        self.resolution_mode = shared_state["resolution_mode"]
         self.threshold_open_loot = shared_state["threshold_open_loot"]
         self.threshold_loot_window = shared_state["threshold_loot_window"]
         self.threshold_hp_full = shared_state["threshold_hp_full"]
         self.threshold_hp_damaged = shared_state["threshold_hp_damaged"]
         self.threshold_hp_empty = shared_state["threshold_hp_empty"]
-        # Debug options
+
         self.debug_mode = shared_state["debug_mode"]
         self.show_coords = shared_state["show_coords"]
         self.show_confidence = shared_state["show_confidence"]
-        # Debug capture selection
         self.debug_capture_open_loot_flag = shared_state["debug_capture_open_loot"]
         self.debug_capture_loot_window_flag = shared_state["debug_capture_loot_window"]
         self.debug_capture_hp_full_flag = shared_state["debug_capture_hp_full"]
         self.debug_capture_hp_damaged_flag = shared_state["debug_capture_hp_damaged"]
         self.debug_capture_hp_empty_flag = shared_state["debug_capture_hp_empty"]
-        # Manual capture trigger
         self.manual_capture_trigger = shared_state["manual_capture_trigger"]
-        # Detection overlay
         self.overlay_enabled = shared_state["overlay_enabled"]
+        self.disable_bot_actions = shared_state["disable_bot_actions"]
+        self.use_overlay_zones_flag = shared_state["use_overlay_zones_flag"]
+        self.overlay_zones_dict = shared_state["overlay_zones_dict"]
+
+        self.overlay_window = None
+        self.overlay_last_regions = None
+
+        try:
+            self.use_overlay_zones = bool(self.use_overlay_zones_flag.value)
+        except Exception:
+            self.use_overlay_zones = False
+
+        try:
+            initial_zones = dict(self.overlay_zones_dict)
+        except Exception:
+            initial_zones = None
+        if initial_zones:
+            normalized = self._normalize_overlay_regions(initial_zones)
+            if normalized:
+                self.overlay_last_regions = normalized
+        else:
+            self.overlay_last_regions = None
+
+        self.current_resolution = "Unknown"
+        self.current_scale_x = 1.0
+        self.current_scale_y = 1.0
+        self.current_border_offset = (0, 0)
 
         self.status_queue = multiprocessing.Queue()
         self.process = None
@@ -588,14 +1062,9 @@ class BotWindow(QtWidgets.QMainWindow):
         self._last_started_state = bool(self.started_flag.value)
         self._force_close = False  # Flag to force exit without tray
 
-        # Detection overlay window
-        self.overlay_window = None
-
-        # Resolution tracking for overlay debugging
-        self.current_resolution = "Unknown"
-        self.current_scale_x = 1.0
-        self.current_scale_y = 1.0
-        self.current_border_offset = (0, 0)
+        # Create session folder once per application run (not per Start/Stop)
+        # Session persists until app is fully closed and reopened
+        self._session_folder = datetime.now().strftime("Session_%d-%m-%Y_%H.%M.%S")
 
         self._init_window()
         self._build_ui()
@@ -604,6 +1073,10 @@ class BotWindow(QtWidgets.QMainWindow):
         self._apply_theme()
         self._finalize_size()
         self._setup_tray_icon()
+
+        # Log session creation
+        self._append_log(f"📁 Session folder created: {self._session_folder}")
+        self._append_log("ℹ️ Session persists until app is closed (not affected by Start/Stop)")
 
     def _init_window(self):
         self.setWindowTitle("TLOPO Looter")
@@ -786,49 +1259,31 @@ class BotWindow(QtWidgets.QMainWindow):
         screenshot_group.setLayout(screenshot_layout)
         advanced_layout.addWidget(screenshot_group)
 
-        # Note about thresholds moved to Debug tab
-        thresholds_note = QtWidgets.QLabel("🐛 Template matching thresholds moved to Debug tab")
-        thresholds_note.setStyleSheet("color: #66d9ff; font-size: 10pt; padding: 10px; background-color: #03101d; border-radius: 5px;")
-        advanced_layout.addWidget(thresholds_note)
+        resolution_group = QtWidgets.QGroupBox("Resolution Strategy")
+        resolution_layout = QtWidgets.QVBoxLayout()
+        resolution_layout.setSpacing(8)
 
-        # Create threshold spinboxes here (they'll be moved to Debug tab layout later)
-        self.threshold_open_loot_spin = QtWidgets.QDoubleSpinBox()
-        self.threshold_open_loot_spin.setDecimals(2)
-        self.threshold_open_loot_spin.setRange(0.10, 1.0)
-        self.threshold_open_loot_spin.setSingleStep(0.05)
-        self.threshold_open_loot_spin.setValue(float(self.threshold_open_loot.value))
-        self.threshold_open_loot_spin.setToolTip("Default: 0.40 | Detects 'Press SHIFT to open' prompt")
+        resolution_info = QtWidgets.QLabel(
+            "Choose whether the bot adapts to the current game resolution or forces 1280x800."
+        )
+        resolution_info.setWordWrap(True)
+        self.resolution_mode_combo = QtWidgets.QComboBox()
+        self.resolution_mode_combo.addItem(
+            bot_logic.RESOLUTION_MODE_LABELS[bot_logic.RESOLUTION_MODE_ADAPTIVE],
+            bot_logic.RESOLUTION_MODE_ADAPTIVE,
+        )
+        self.resolution_mode_combo.addItem(
+            bot_logic.RESOLUTION_MODE_LABELS[bot_logic.RESOLUTION_MODE_FORCED],
+            bot_logic.RESOLUTION_MODE_FORCED,
+        )
+        current_mode_index = self.resolution_mode_combo.findData(int(self.resolution_mode.value))
+        if current_mode_index != -1:
+            self.resolution_mode_combo.setCurrentIndex(current_mode_index)
 
-        self.threshold_loot_window_spin = QtWidgets.QDoubleSpinBox()
-        self.threshold_loot_window_spin.setDecimals(2)
-        self.threshold_loot_window_spin.setRange(0.10, 1.0)
-        self.threshold_loot_window_spin.setSingleStep(0.05)
-        self.threshold_loot_window_spin.setValue(float(self.threshold_loot_window.value))
-        self.threshold_loot_window_spin.setToolTip("Default: 0.35 | Detects loot chest window UI")
-
-        self.threshold_hp_full_spin = QtWidgets.QDoubleSpinBox()
-        self.threshold_hp_full_spin.setDecimals(2)
-        self.threshold_hp_full_spin.setRange(0.10, 1.0)
-        self.threshold_hp_full_spin.setSingleStep(0.05)
-        self.threshold_hp_full_spin.setValue(float(self.threshold_hp_full.value))
-        self.threshold_hp_full_spin.setToolTip("Default: 0.85 | Detects enemy with full HP")
-
-        self.threshold_hp_damaged_spin = QtWidgets.QDoubleSpinBox()
-        self.threshold_hp_damaged_spin.setDecimals(2)
-        self.threshold_hp_damaged_spin.setRange(0.10, 1.0)
-        self.threshold_hp_damaged_spin.setSingleStep(0.05)
-        self.threshold_hp_damaged_spin.setValue(float(self.threshold_hp_damaged.value))
-        self.threshold_hp_damaged_spin.setToolTip("Default: 0.95 | Detects enemy with damaged HP")
-
-        self.threshold_hp_empty_spin = QtWidgets.QDoubleSpinBox()
-        self.threshold_hp_empty_spin.setDecimals(2)
-        self.threshold_hp_empty_spin.setRange(0.10, 1.0)
-        self.threshold_hp_empty_spin.setSingleStep(0.05)
-        self.threshold_hp_empty_spin.setValue(float(self.threshold_hp_empty.value))
-        self.threshold_hp_empty_spin.setToolTip("Default: 0.90 | Detects enemy with empty HP")
-
-        self.reset_thresholds_button = QtWidgets.QPushButton("Reset Thresholds to Defaults")
-        self.reset_thresholds_button.setObjectName("resetThresholdsButton")
+        resolution_layout.addWidget(resolution_info)
+        resolution_layout.addWidget(self.resolution_mode_combo)
+        resolution_group.setLayout(resolution_layout)
+        advanced_layout.addWidget(resolution_group)
 
         log_group = QtWidgets.QGroupBox("Event Log")
         log_layout = QtWidgets.QVBoxLayout()
@@ -844,6 +1299,127 @@ class BotWindow(QtWidgets.QMainWindow):
         advanced_layout.addWidget(log_group)
 
         self.tab_widget.addTab(advanced_page, "Advanced Settings")
+
+        debug_page = QtWidgets.QWidget()
+        debug_layout = QtWidgets.QVBoxLayout(debug_page)
+        debug_layout.setContentsMargins(6, 6, 6, 6)
+        debug_layout.setSpacing(8)
+
+        debug_mode_group = QtWidgets.QGroupBox("Debug Options")
+        debug_mode_layout = QtWidgets.QVBoxLayout()
+        self.debug_mode_checkbox = QtWidgets.QCheckBox("Enable debug mode (save detection snapshots)")
+        self.debug_mode_checkbox.setChecked(bool(self.debug_mode.value))
+        debug_mode_layout.addWidget(self.debug_mode_checkbox)
+
+        self.show_coords_checkbox = QtWidgets.QCheckBox("Log click coordinates to event log")
+        self.show_coords_checkbox.setChecked(bool(self.show_coords.value))
+        debug_mode_layout.addWidget(self.show_coords_checkbox)
+
+        self.show_confidence_checkbox = QtWidgets.QCheckBox("Log template match confidence values")
+        self.show_confidence_checkbox.setChecked(bool(self.show_confidence.value))
+        debug_mode_layout.addWidget(self.show_confidence_checkbox)
+
+        self.disable_bot_actions_checkbox = QtWidgets.QCheckBox("Disable bot actions (detection only mode)")
+        self.disable_bot_actions_checkbox.setChecked(bool(self.disable_bot_actions.value))
+        debug_mode_layout.addWidget(self.disable_bot_actions_checkbox)
+
+        self.use_overlay_zones_checkbox = QtWidgets.QCheckBox("Use overlay detection zones")
+        self.use_overlay_zones_checkbox.setChecked(self.use_overlay_zones)
+        self.use_overlay_zones_checkbox.setToolTip(
+            "When enabled, the bot will use detection zones adjusted in the overlay window."
+        )
+        debug_mode_layout.addWidget(self.use_overlay_zones_checkbox)
+
+        debug_mode_group.setLayout(debug_mode_layout)
+        debug_layout.addWidget(debug_mode_group)
+
+        threshold_group = QtWidgets.QGroupBox("Template Thresholds")
+        threshold_layout = QtWidgets.QGridLayout()
+
+        self.threshold_open_loot_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_open_loot_spin.setDecimals(2)
+        self.threshold_open_loot_spin.setRange(0.1, 1.0)
+        self.threshold_open_loot_spin.setSingleStep(0.05)
+        self.threshold_open_loot_spin.setValue(float(self.threshold_open_loot.value))
+
+        self.threshold_loot_window_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_loot_window_spin.setDecimals(2)
+        self.threshold_loot_window_spin.setRange(0.1, 1.0)
+        self.threshold_loot_window_spin.setSingleStep(0.05)
+        self.threshold_loot_window_spin.setValue(float(self.threshold_loot_window.value))
+
+        self.threshold_hp_full_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_hp_full_spin.setDecimals(2)
+        self.threshold_hp_full_spin.setRange(0.1, 1.0)
+        self.threshold_hp_full_spin.setSingleStep(0.05)
+        self.threshold_hp_full_spin.setValue(float(self.threshold_hp_full.value))
+
+        self.threshold_hp_damaged_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_hp_damaged_spin.setDecimals(2)
+        self.threshold_hp_damaged_spin.setRange(0.1, 1.0)
+        self.threshold_hp_damaged_spin.setSingleStep(0.05)
+        self.threshold_hp_damaged_spin.setValue(float(self.threshold_hp_damaged.value))
+
+        self.threshold_hp_empty_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_hp_empty_spin.setDecimals(2)
+        self.threshold_hp_empty_spin.setRange(0.1, 1.0)
+        self.threshold_hp_empty_spin.setSingleStep(0.05)
+        self.threshold_hp_empty_spin.setValue(float(self.threshold_hp_empty.value))
+
+        threshold_layout.addWidget(QtWidgets.QLabel("Open Loot"), 0, 0)
+        threshold_layout.addWidget(self.threshold_open_loot_spin, 0, 1)
+        threshold_layout.addWidget(QtWidgets.QLabel("Loot Window"), 1, 0)
+        threshold_layout.addWidget(self.threshold_loot_window_spin, 1, 1)
+        threshold_layout.addWidget(QtWidgets.QLabel("Enemy HP Full"), 2, 0)
+        threshold_layout.addWidget(self.threshold_hp_full_spin, 2, 1)
+        threshold_layout.addWidget(QtWidgets.QLabel("Enemy HP Damaged"), 3, 0)
+        threshold_layout.addWidget(self.threshold_hp_damaged_spin, 3, 1)
+        threshold_layout.addWidget(QtWidgets.QLabel("Enemy HP Empty"), 4, 0)
+        threshold_layout.addWidget(self.threshold_hp_empty_spin, 4, 1)
+
+        self.reset_thresholds_button = QtWidgets.QPushButton("Reset Thresholds")
+        threshold_layout.addWidget(self.reset_thresholds_button, 5, 0, 1, 2)
+
+        threshold_group.setLayout(threshold_layout)
+        debug_layout.addWidget(threshold_group)
+
+        capture_group = QtWidgets.QGroupBox("Debug Capture Filters")
+        capture_layout = QtWidgets.QVBoxLayout()
+        self.debug_capture_open_loot_checkbox = QtWidgets.QCheckBox("Capture open-loot prompt region")
+        self.debug_capture_open_loot_checkbox.setChecked(bool(self.debug_capture_open_loot_flag.value))
+        capture_layout.addWidget(self.debug_capture_open_loot_checkbox)
+
+        self.debug_capture_loot_window_checkbox = QtWidgets.QCheckBox("Capture loot window contents")
+        self.debug_capture_loot_window_checkbox.setChecked(bool(self.debug_capture_loot_window_flag.value))
+        capture_layout.addWidget(self.debug_capture_loot_window_checkbox)
+
+        self.debug_capture_hp_full_checkbox = QtWidgets.QCheckBox("Capture enemy HP (full)")
+        self.debug_capture_hp_full_checkbox.setChecked(bool(self.debug_capture_hp_full_flag.value))
+        capture_layout.addWidget(self.debug_capture_hp_full_checkbox)
+
+        self.debug_capture_hp_damaged_checkbox = QtWidgets.QCheckBox("Capture enemy HP (damaged)")
+        self.debug_capture_hp_damaged_checkbox.setChecked(bool(self.debug_capture_hp_damaged_flag.value))
+        capture_layout.addWidget(self.debug_capture_hp_damaged_checkbox)
+
+        self.debug_capture_hp_empty_checkbox = QtWidgets.QCheckBox("Capture enemy HP (empty)")
+        self.debug_capture_hp_empty_checkbox.setChecked(bool(self.debug_capture_hp_empty_flag.value))
+        capture_layout.addWidget(self.debug_capture_hp_empty_checkbox)
+
+        capture_group.setLayout(capture_layout)
+        debug_layout.addWidget(capture_group)
+
+        control_row = QtWidgets.QHBoxLayout()
+        self.manual_capture_button = QtWidgets.QPushButton("Manual Capture")
+        self.manual_capture_button.setEnabled(bool(self.debug_mode.value))
+        control_row.addWidget(self.manual_capture_button)
+        self.overlay_checkbox = QtWidgets.QCheckBox("Show detection overlay window")
+        self.overlay_checkbox.setChecked(bool(self.overlay_enabled.value))
+        control_row.addWidget(self.overlay_checkbox)
+        control_row.addStretch()
+        debug_layout.addLayout(control_row)
+
+        debug_layout.addStretch()
+        self.tab_widget.addTab(debug_page, "Debug")
 
         # Help Tab
         help_page = QtWidgets.QWidget()
@@ -875,8 +1451,8 @@ class BotWindow(QtWidgets.QMainWindow):
         <ol>
             <li>Configure game DPI settings:
                 <ul>
-                    <li>Right-click the game shortcut → Properties</li>
-                    <li>Compatibility tab → "Change high DPI settings"</li>
+                    <li>Right-click the game shortcut -> Properties</li>
+                    <li>Compatibility tab -> "Change high DPI settings"</li>
                     <li>Check "Override high DPI scaling"</li>
                     <li>Select <b>"System"</b> from the dropdown</li>
                     <li>Click OK and restart the game</li>
@@ -964,185 +1540,6 @@ class BotWindow(QtWidgets.QMainWindow):
         help_layout.addWidget(help_text)
         self.tab_widget.addTab(help_page, "❓ Help")
 
-        # Debug Tab
-        debug_page = QtWidgets.QWidget()
-        debug_layout = QtWidgets.QVBoxLayout(debug_page)
-        debug_layout.setContentsMargins(6, 6, 6, 6)
-        debug_layout.setSpacing(8)
-
-        # Threshold controls (now in Debug tab)
-        debug_threshold_group = QtWidgets.QGroupBox("🎯 Template Matching Thresholds")
-        debug_threshold_layout = QtWidgets.QGridLayout()
-        debug_threshold_layout.setHorizontalSpacing(12)
-        debug_threshold_layout.setVerticalSpacing(8)
-
-        # Info label
-        threshold_info = QtWidgets.QLabel("⚠️ Range: 0.10 (very lenient) to 1.00 (strict)\n"
-                                         "Lower = easier detection, more false positives\n"
-                                         "At 1024x768: Try 0.20-0.30 for Open Loot and Loot Window")
-        threshold_info.setStyleSheet("color: #ffa500; font-size: 9pt; padding: 5px;")
-        debug_threshold_layout.addWidget(threshold_info, 0, 0, 1, 2)
-
-        # Reference existing spinboxes (already created in Advanced tab)
-        row = 1
-        debug_threshold_layout.addWidget(QtWidgets.QLabel("Open Loot Detection"), row, 0)
-        debug_threshold_layout.addWidget(self.threshold_open_loot_spin, row, 1)
-        row += 1
-
-        debug_threshold_layout.addWidget(QtWidgets.QLabel("Loot Window Detection"), row, 0)
-        debug_threshold_layout.addWidget(self.threshold_loot_window_spin, row, 1)
-        row += 1
-
-        debug_threshold_layout.addWidget(QtWidgets.QLabel("HP Full Detection"), row, 0)
-        debug_threshold_layout.addWidget(self.threshold_hp_full_spin, row, 1)
-        row += 1
-
-        debug_threshold_layout.addWidget(QtWidgets.QLabel("HP Damaged Detection"), row, 0)
-        debug_threshold_layout.addWidget(self.threshold_hp_damaged_spin, row, 1)
-        row += 1
-
-        debug_threshold_layout.addWidget(QtWidgets.QLabel("HP Empty Detection"), row, 0)
-        debug_threshold_layout.addWidget(self.threshold_hp_empty_spin, row, 1)
-        row += 1
-
-        # Reset button
-        debug_threshold_layout.addWidget(self.reset_thresholds_button, row, 0, 1, 2)
-
-        debug_threshold_group.setLayout(debug_threshold_layout)
-        debug_layout.addWidget(debug_threshold_group)
-
-        # Debug Visualization Options
-        debug_viz_group = QtWidgets.QGroupBox("🔍 Detection Visualization")
-        debug_viz_layout = QtWidgets.QVBoxLayout()
-        debug_viz_layout.setSpacing(8)
-
-        # Enable debug mode
-        self.debug_mode_checkbox = QtWidgets.QCheckBox("Enable Debug Mode (saves detection screenshots)")
-        self.debug_mode_checkbox.setChecked(False)
-        self.debug_mode_checkbox.setToolTip("Saves screenshots of each detection attempt to Data/Debug/ folder")
-        debug_viz_layout.addWidget(self.debug_mode_checkbox)
-
-        # Show click coordinates
-        self.show_coords_checkbox = QtWidgets.QCheckBox("Log click coordinates in Event Log")
-        self.show_coords_checkbox.setChecked(False)
-        self.show_coords_checkbox.setToolTip("Shows exact X,Y coordinates where bot clicks")
-        debug_viz_layout.addWidget(self.show_coords_checkbox)
-
-        # Show detection confidence
-        self.show_confidence_checkbox = QtWidgets.QCheckBox("Log template match confidence scores")
-        self.show_confidence_checkbox.setChecked(False)
-        self.show_confidence_checkbox.setToolTip("Shows how confident the bot is about each detection (0.0-1.0)")
-        debug_viz_layout.addWidget(self.show_confidence_checkbox)
-
-        # Add separator
-        separator = QtWidgets.QFrame()
-        separator.setFrameShape(QtWidgets.QFrame.HLine)
-        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
-        debug_viz_layout.addWidget(separator)
-
-        # Debug capture selection label
-        capture_label = QtWidgets.QLabel("📷 Select which detections to capture (when Debug Mode enabled):")
-        capture_label.setStyleSheet("color: #ffa500; font-weight: bold; margin-top: 5px;")
-        debug_viz_layout.addWidget(capture_label)
-
-        # Checkboxes for each detection type
-        self.debug_capture_open_loot = QtWidgets.QCheckBox("Capture Open Loot prompt")
-        self.debug_capture_open_loot.setChecked(True)
-        debug_viz_layout.addWidget(self.debug_capture_open_loot)
-
-        self.debug_capture_loot_window = QtWidgets.QCheckBox("Capture Loot Window")
-        self.debug_capture_loot_window.setChecked(True)
-        debug_viz_layout.addWidget(self.debug_capture_loot_window)
-
-        self.debug_capture_hp_full = QtWidgets.QCheckBox("Capture Enemy HP (Full)")
-        self.debug_capture_hp_full.setChecked(False)
-        debug_viz_layout.addWidget(self.debug_capture_hp_full)
-
-        self.debug_capture_hp_damaged = QtWidgets.QCheckBox("Capture Enemy HP (Damaged)")
-        self.debug_capture_hp_damaged.setChecked(False)
-        debug_viz_layout.addWidget(self.debug_capture_hp_damaged)
-
-        self.debug_capture_hp_empty = QtWidgets.QCheckBox("Capture Enemy HP (Empty)")
-        self.debug_capture_hp_empty.setChecked(False)
-        debug_viz_layout.addWidget(self.debug_capture_hp_empty)
-
-        # Capture current state button
-        self.capture_state_button = QtWidgets.QPushButton("📸 Capture Current Detection State")
-        self.capture_state_button.setObjectName("captureStateButton")
-        self.capture_state_button.setToolTip("Saves screenshots of all detection zones RIGHT NOW for inspection")
-        debug_viz_layout.addWidget(self.capture_state_button)
-
-        # Open debug folder button
-        self.open_debug_folder_button = QtWidgets.QPushButton("📂 Open Debug Screenshot Folder")
-        self.open_debug_folder_button.setObjectName("openDebugFolderButton")
-        debug_viz_layout.addWidget(self.open_debug_folder_button)
-
-        # Add separator
-        separator2 = QtWidgets.QFrame()
-        separator2.setFrameShape(QtWidgets.QFrame.HLine)
-        separator2.setFrameShadow(QtWidgets.QFrame.Sunken)
-        debug_viz_layout.addWidget(separator2)
-
-        # Detection overlay window button
-        self.show_overlay_button = QtWidgets.QPushButton("🎯 Show Detection Overlay Window")
-        self.show_overlay_button.setObjectName("showOverlayButton")
-        self.show_overlay_button.setToolTip("Opens real-time window showing detection zones (Green = detected, Red = not detected)")
-        self.show_overlay_button.setCheckable(True)
-        self.show_overlay_button.setChecked(False)
-        debug_viz_layout.addWidget(self.show_overlay_button)
-
-        debug_viz_group.setLayout(debug_viz_layout)
-        debug_layout.addWidget(debug_viz_group)
-
-        # Detection Info Display
-        debug_info_group = QtWidgets.QGroupBox("📊 Current Detection Info")
-        debug_info_layout = QtWidgets.QGridLayout()
-        debug_info_layout.setHorizontalSpacing(12)
-        debug_info_layout.setVerticalSpacing(6)
-
-        # Resolution info
-        debug_info_layout.addWidget(QtWidgets.QLabel("Game Resolution:"), 0, 0)
-        self.debug_resolution_label = QtWidgets.QLabel("Not detected yet")
-        self.debug_resolution_label.setStyleSheet("color: #66d9ff; font-weight: bold;")
-        debug_info_layout.addWidget(self.debug_resolution_label, 0, 1)
-
-        # Scale factors
-        debug_info_layout.addWidget(QtWidgets.QLabel("Scale Factors:"), 1, 0)
-        self.debug_scale_label = QtWidgets.QLabel("Not detected yet")
-        self.debug_scale_label.setStyleSheet("color: #66d9ff; font-weight: bold;")
-        debug_info_layout.addWidget(self.debug_scale_label, 1, 1)
-
-        # Last detection
-        debug_info_layout.addWidget(QtWidgets.QLabel("Last Detection:"), 2, 0)
-        self.debug_last_detection_label = QtWidgets.QLabel("None")
-        self.debug_last_detection_label.setStyleSheet("color: #46ff9a; font-weight: bold;")
-        debug_info_layout.addWidget(self.debug_last_detection_label, 2, 1)
-
-        # Last click
-        debug_info_layout.addWidget(QtWidgets.QLabel("Last Click:"), 3, 0)
-        self.debug_last_click_label = QtWidgets.QLabel("None")
-        self.debug_last_click_label.setStyleSheet("color: #46ff9a; font-weight: bold;")
-        debug_info_layout.addWidget(self.debug_last_click_label, 3, 1)
-
-        debug_info_group.setLayout(debug_info_layout)
-        debug_layout.addWidget(debug_info_group)
-
-        # Debug hints
-        debug_hints = QtWidgets.QLabel(
-            "💡 Troubleshooting Tips:\n"
-            "• At 1024x768: Lower Open Loot to 0.20-0.25, Loot Window to 0.15-0.20\n"
-            "• Enable Debug Mode to see what the bot sees\n"
-            "• Check 'Log coordinates' to verify click positions\n"
-            "• Use 'Capture State' button when bot should detect something but doesn't"
-        )
-        debug_hints.setStyleSheet("color: #8af7ff; font-size: 9pt; padding: 10px; background-color: #03101d; border-radius: 5px;")
-        debug_hints.setWordWrap(True)
-        debug_layout.addWidget(debug_hints)
-
-        debug_layout.addStretch()
-
-        self.tab_widget.addTab(debug_page, "🐛 Debug")
-
         self._update_status_labels(initial=True)
 
     def _connect_signals(self):
@@ -1156,8 +1553,8 @@ class BotWindow(QtWidgets.QMainWindow):
 
         self.screenshot_checkbox.stateChanged.connect(self._handle_screenshot_toggled)
         self.open_folder_button.clicked.connect(self._handle_open_folder)
+        self.resolution_mode_combo.currentIndexChanged.connect(self._handle_resolution_mode_changed)
 
-        # Threshold spinbox signals
         self.threshold_open_loot_spin.valueChanged.connect(self._handle_threshold_open_loot_changed)
         self.threshold_loot_window_spin.valueChanged.connect(self._handle_threshold_loot_window_changed)
         self.threshold_hp_full_spin.valueChanged.connect(self._handle_threshold_hp_full_changed)
@@ -1165,19 +1562,31 @@ class BotWindow(QtWidgets.QMainWindow):
         self.threshold_hp_empty_spin.valueChanged.connect(self._handle_threshold_hp_empty_changed)
         self.reset_thresholds_button.clicked.connect(self._handle_reset_thresholds)
 
-        # Debug signals
         self.debug_mode_checkbox.stateChanged.connect(self._handle_debug_mode_toggled)
         self.show_coords_checkbox.stateChanged.connect(self._handle_show_coords_toggled)
         self.show_confidence_checkbox.stateChanged.connect(self._handle_show_confidence_toggled)
-        self.capture_state_button.clicked.connect(self._handle_capture_state)
-        self.open_debug_folder_button.clicked.connect(self._handle_open_debug_folder)
-        self.show_overlay_button.toggled.connect(self._handle_show_overlay_toggled)
-        # Debug capture selection signals
-        self.debug_capture_open_loot.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('open_loot', state))
-        self.debug_capture_loot_window.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('loot_window', state))
-        self.debug_capture_hp_full.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('hp_full', state))
-        self.debug_capture_hp_damaged.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('hp_damaged', state))
-        self.debug_capture_hp_empty.stateChanged.connect(lambda state: self._handle_debug_capture_toggled('hp_empty', state))
+
+        self.debug_capture_open_loot_checkbox.stateChanged.connect(
+            lambda state: self._handle_debug_capture_toggled(self.debug_capture_open_loot_flag, state)
+        )
+        self.debug_capture_loot_window_checkbox.stateChanged.connect(
+            lambda state: self._handle_debug_capture_toggled(self.debug_capture_loot_window_flag, state)
+        )
+        self.debug_capture_hp_full_checkbox.stateChanged.connect(
+            lambda state: self._handle_debug_capture_toggled(self.debug_capture_hp_full_flag, state)
+        )
+        self.debug_capture_hp_damaged_checkbox.stateChanged.connect(
+            lambda state: self._handle_debug_capture_toggled(self.debug_capture_hp_damaged_flag, state)
+        )
+        self.debug_capture_hp_empty_checkbox.stateChanged.connect(
+            lambda state: self._handle_debug_capture_toggled(self.debug_capture_hp_empty_flag, state)
+        )
+
+        self.disable_bot_actions_checkbox.stateChanged.connect(self._handle_disable_bot_actions_toggled)
+        self.use_overlay_zones_checkbox.stateChanged.connect(self._handle_use_overlay_zones_toggled)
+
+        self.manual_capture_button.clicked.connect(self._handle_manual_capture)
+        self.overlay_checkbox.stateChanged.connect(self._handle_overlay_toggled)
 
     def _start_status_timer(self):
         self.status_timer = QtCore.QTimer(self)
@@ -1283,51 +1692,138 @@ class BotWindow(QtWidgets.QMainWindow):
         Returns: (success, error_message)
         """
         try:
-            # Run validation in subprocess to avoid PyQt5 event loop interference
-            # PyQt5's event loop causes window resize to fail
-            import subprocess
-            import sys
+            mode = int(self.resolution_mode.value)
+            # Check if running as frozen exe (PyInstaller)
+            if getattr(sys, 'frozen', False):
+                # Running as compiled exe - run validation directly (no subprocess)
+                # Frozen exe doesn't support -c flag, would cause GUI to open again
+                success, msg, details = bot_logic.validate_game_ready(mode)
 
-            # Run validation script directly
-            result = subprocess.run(
-                [sys.executable, "-c",
-                 "import bot_logic; success, msg, details = bot_logic.validate_game_ready(); print('SUCCESS' if success else f'FAIL:{msg}')"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+                self._apply_validation_details(details)
 
-            # Get last line only (ignore any debug output)
-            lines = result.stdout.strip().split('\n')
-            last_line = lines[-1] if lines else ''
-
-            if last_line == 'SUCCESS':
-                return (True, "Validation passed")
-            elif last_line.startswith('FAIL:'):
-                return (False, last_line[5:])  # Remove 'FAIL:' prefix
+                if success:
+                    return (True, "Validation passed")
+                else:
+                    return (False, msg)
             else:
-                return (False, f"Validation error: {last_line if last_line else 'No output'}")
+                # Running as Python script - use subprocess to avoid PyQt5 event loop interference
+                # PyQt5's event loop causes window resize to fail
+                import subprocess
 
-        except subprocess.TimeoutExpired:
-            return (False, "Validation timeout")
+                # Run validation script directly
+                # Use special prefix for DPI issues so GUI can handle them differently
+                result = subprocess.run(
+                    [sys.executable, "-c",
+                     f"import bot_logic; success, msg, details = bot_logic.validate_game_ready({mode}); "
+                     "prefix = 'DPI_ERROR:' if not success and 'DPI Override Configuration Issue' in msg else 'FAIL:'; "
+                     "print('SUCCESS' if success else f'{prefix}{msg}')"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                # Get output (handle multiline messages)
+                output = result.stdout.strip()
+
+                if output == 'SUCCESS':
+                    return (True, "Validation passed")
+                elif output.startswith('DPI_ERROR:'):
+                    # DPI error - return with special marker (may be multiline)
+                    return (False, output[10:])  # Remove 'DPI_ERROR:' prefix
+                elif output.startswith('FAIL:'):
+                    # Get last line only for regular errors (ignore debug output)
+                    lines = output.split('\n')
+                    last_line = lines[-1] if lines else ''
+                    return (False, last_line[5:] if last_line.startswith('FAIL:') else output[5:])
+                else:
+                    return (False, f"Validation error: {output if output else 'No output'}")
+
         except Exception as e:
             return (False, f"Validation error: {e}")
 
     def _show_validation_error(self, error_message):
-        """Show error dialog and switch to Help tab"""
-        msg_box = QMessageBox(self)
-        msg_box.setIcon(QMessageBox.Critical)
-        msg_box.setWindowTitle("Startup Validation Failed")
-        msg_box.setText(error_message)
-        msg_box.setInformativeText("Please check the Help tab for setup instructions.")
-        msg_box.setStandardButtons(QMessageBox.Ok)
-        msg_box.exec_()
+        """Show error dialog and switch to Help tab. Handles DPI fix automatically."""
 
-        # Switch to Help tab (index 2: Overview=0, Advanced=1, Help=2)
-        self.tab_widget.setCurrentIndex(2)
+        # Check if this is a DPI configuration issue that can be auto-fixed
+        if "DPI Override Configuration Issue" in error_message:
+            # Show Yes/No dialog for auto-fix
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.setWindowTitle("DPI Configuration Required")
+            msg_box.setText(error_message)
+            msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg_box.setDefaultButton(QMessageBox.Yes)
 
-        # Log the validation failure
-        self._append_log(f"Startup blocked: {error_message}")
+            response = msg_box.exec_()
+
+            if response == QMessageBox.Yes:
+                # User wants to apply fix - use centralized workflow
+                self._append_log("Applying DPI override fix...")
+
+                try:
+                    handle = bot_logic.check_window()
+                    if handle:
+                        # Use centralized DPI configuration handler
+                        result = bot_logic.handle_dpi_configuration(handle)
+
+                        if result['action'] == 'fixed':
+                            # Success - show restart instruction
+                            success_box = QMessageBox(self)
+                            success_box.setIcon(QMessageBox.Information)
+                            success_box.setWindowTitle("DPI Override Applied")
+                            success_box.setText("✅ DPI override has been set to 'System'")
+                            success_box.setInformativeText(
+                                "IMPORTANT: You must RESTART the game for changes to take effect.\n\n"
+                                "Steps:\n"
+                                "1. Close the game completely\n"
+                                "2. Restart the game\n"
+                                "3. Click Start in the bot again"
+                            )
+                            success_box.setStandardButtons(QMessageBox.Ok)
+                            success_box.exec_()
+
+                            self._append_log(f"✅ {result['message']}")
+                            self._append_log("⚠️ Please restart the game for changes to take effect.")
+                        elif result['action'] == 'already_correct':
+                            # Already configured correctly
+                            self._append_log(f"✅ {result['message']}")
+                        else:
+                            # Failed to apply fix
+                            fail_box = QMessageBox(self)
+                            fail_box.setIcon(QMessageBox.Critical)
+                            fail_box.setWindowTitle("Failed to Apply Fix")
+                            fail_box.setText(f"❌ {result['message']}")
+                            fail_box.setInformativeText("Please apply the fix manually. Check the Help tab for instructions.")
+                            fail_box.setStandardButtons(QMessageBox.Ok)
+                            fail_box.exec_()
+
+                            self._append_log(f"❌ {result['message']}")
+                            self.tab_widget.setCurrentIndex(2)  # Switch to Help tab
+                    else:
+                        self._append_log("❌ Could not find game window")
+                        self.tab_widget.setCurrentIndex(2)
+                except Exception as e:
+                    self._append_log(f"❌ Error applying DPI fix: {e}")
+                    self.tab_widget.setCurrentIndex(2)
+            else:
+                # User declined fix - show manual instructions
+                self._append_log("DPI fix declined. Please configure manually.")
+                self.tab_widget.setCurrentIndex(2)  # Switch to Help tab
+        else:
+            # Regular validation error - show normal error dialog
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Critical)
+            msg_box.setWindowTitle("Startup Validation Failed")
+            msg_box.setText(error_message)
+            msg_box.setInformativeText("Please check the Help tab for setup instructions.")
+            msg_box.setStandardButtons(QMessageBox.Ok)
+            msg_box.exec_()
+
+            # Switch to Help tab (index 2: Overview=0, Advanced=1, Help=2)
+            self.tab_widget.setCurrentIndex(2)
+
+            # Log the validation failure
+            self._append_log(f"Startup blocked: {error_message}")
 
     def _handle_start_clicked(self):
         if self._bot_is_running():
@@ -1341,8 +1837,25 @@ class BotWindow(QtWidgets.QMainWindow):
             return
 
         try:
+            use_overlay_zones = self.use_overlay_zones_checkbox.isChecked()
+            if use_overlay_zones:
+                regions_to_share = self._collect_overlay_regions()
+                if regions_to_share:
+                    self._update_shared_overlay_zones(regions_to_share, force=True)
+                else:
+                    self._append_log("Overlay zones requested but not available; using defaults.")
+                    use_overlay_zones = False
+
+            try:
+                with self.use_overlay_zones_flag.get_lock():
+                    self.use_overlay_zones_flag.value = 1 if use_overlay_zones else 0
+            except Exception:
+                pass
+
             self.gui_settings_opened.value = False
             self._drain_status_queue(log_messages=False)
+            if use_overlay_zones:
+                self._append_log("Overlay detection zones will be used for this run.")
             self.process = multiprocessing.Process(
                 target=bot_logic.run_bot,
                 args=(
@@ -1354,6 +1867,7 @@ class BotWindow(QtWidgets.QMainWindow):
                     self.legendaries,
                     self.status_queue,
                     self.screenshot_enabled,
+                    self.resolution_mode,
                     self.threshold_open_loot,
                     self.threshold_loot_window,
                     self.threshold_hp_full,
@@ -1369,6 +1883,10 @@ class BotWindow(QtWidgets.QMainWindow):
                     self.debug_capture_hp_empty_flag,
                     self.manual_capture_trigger,
                     self.overlay_enabled,
+                    self.disable_bot_actions,
+                    self.use_overlay_zones_flag,
+                    self.overlay_zones_dict,
+                    self._session_folder,  # Pass persistent session folder
                 ),
             )
             self.process.daemon = True
@@ -1432,192 +1950,6 @@ class BotWindow(QtWidgets.QMainWindow):
         if self.attack_spin.hasFocus():
             self._append_log(f"Updated attack delay to {value:.3f}s.")
 
-    def _handle_threshold_open_loot_changed(self, value):
-        if self._syncing_controls:
-            return
-        with self.threshold_open_loot.get_lock():
-            self.threshold_open_loot.value = float(value)
-        if self.threshold_open_loot_spin.hasFocus():
-            self._append_log(f"Updated Open Loot threshold to {value:.2f}.")
-
-    def _handle_threshold_loot_window_changed(self, value):
-        if self._syncing_controls:
-            return
-        with self.threshold_loot_window.get_lock():
-            self.threshold_loot_window.value = float(value)
-        if self.threshold_loot_window_spin.hasFocus():
-            self._append_log(f"Updated Loot Window threshold to {value:.2f}.")
-
-    def _handle_threshold_hp_full_changed(self, value):
-        if self._syncing_controls:
-            return
-        with self.threshold_hp_full.get_lock():
-            self.threshold_hp_full.value = float(value)
-        if self.threshold_hp_full_spin.hasFocus():
-            self._append_log(f"Updated HP Full threshold to {value:.2f}.")
-
-    def _handle_threshold_hp_damaged_changed(self, value):
-        if self._syncing_controls:
-            return
-        with self.threshold_hp_damaged.get_lock():
-            self.threshold_hp_damaged.value = float(value)
-        if self.threshold_hp_damaged_spin.hasFocus():
-            self._append_log(f"Updated HP Damaged threshold to {value:.2f}.")
-
-    def _handle_threshold_hp_empty_changed(self, value):
-        if self._syncing_controls:
-            return
-        with self.threshold_hp_empty.get_lock():
-            self.threshold_hp_empty.value = float(value)
-        if self.threshold_hp_empty_spin.hasFocus():
-            self._append_log(f"Updated HP Empty threshold to {value:.2f}.")
-
-    def _handle_reset_thresholds(self):
-        defaults = {
-            "threshold_open_loot": 0.40,
-            "threshold_loot_window": 0.35,
-            "threshold_hp_full": 0.85,
-            "threshold_hp_damaged": 0.95,
-            "threshold_hp_empty": 0.90,
-        }
-        with self.threshold_open_loot.get_lock():
-            self.threshold_open_loot.value = defaults["threshold_open_loot"]
-        with self.threshold_loot_window.get_lock():
-            self.threshold_loot_window.value = defaults["threshold_loot_window"]
-        with self.threshold_hp_full.get_lock():
-            self.threshold_hp_full.value = defaults["threshold_hp_full"]
-        with self.threshold_hp_damaged.get_lock():
-            self.threshold_hp_damaged.value = defaults["threshold_hp_damaged"]
-        with self.threshold_hp_empty.get_lock():
-            self.threshold_hp_empty.value = defaults["threshold_hp_empty"]
-
-        self._syncing_controls = True
-        self.threshold_open_loot_spin.setValue(defaults["threshold_open_loot"])
-        self.threshold_loot_window_spin.setValue(defaults["threshold_loot_window"])
-        self.threshold_hp_full_spin.setValue(defaults["threshold_hp_full"])
-        self.threshold_hp_damaged_spin.setValue(defaults["threshold_hp_damaged"])
-        self.threshold_hp_empty_spin.setValue(defaults["threshold_hp_empty"])
-        self._syncing_controls = False
-        self._append_log("Threshold settings reset to defaults.")
-
-    def _handle_debug_mode_toggled(self, state):
-        """Handle debug mode checkbox toggle"""
-        is_enabled = (state == QtCore.Qt.Checked)
-        with self.debug_mode.get_lock():
-            self.debug_mode.value = is_enabled
-        status_text = "enabled" if is_enabled else "disabled"
-        self._append_log(f"Debug mode {status_text}. Detection screenshots will {'be saved' if is_enabled else 'NOT be saved'} to Data/Debug/")
-
-    def _handle_show_coords_toggled(self, state):
-        """Handle show coordinates checkbox toggle"""
-        is_enabled = (state == QtCore.Qt.Checked)
-        with self.show_coords.get_lock():
-            self.show_coords.value = is_enabled
-        status_text = "enabled" if is_enabled else "disabled"
-        self._append_log(f"Coordinate logging {status_text}.")
-
-    def _handle_show_confidence_toggled(self, state):
-        """Handle show confidence checkbox toggle"""
-        is_enabled = (state == QtCore.Qt.Checked)
-        with self.show_confidence.get_lock():
-            self.show_confidence.value = is_enabled
-        status_text = "enabled" if is_enabled else "disabled"
-        self._append_log(f"Confidence score logging {status_text}.")
-
-    def _handle_debug_capture_toggled(self, detection_type, state):
-        """Handle debug capture checkbox toggle"""
-        is_enabled = (state == QtCore.Qt.Checked)
-        flag_map = {
-            'open_loot': self.debug_capture_open_loot_flag,
-            'loot_window': self.debug_capture_loot_window_flag,
-            'hp_full': self.debug_capture_hp_full_flag,
-            'hp_damaged': self.debug_capture_hp_damaged_flag,
-            'hp_empty': self.debug_capture_hp_empty_flag,
-        }
-        if detection_type in flag_map:
-            with flag_map[detection_type].get_lock():
-                flag_map[detection_type].value = is_enabled
-            name_map = {
-                'open_loot': 'Open Loot',
-                'loot_window': 'Loot Window',
-                'hp_full': 'HP Full',
-                'hp_damaged': 'HP Damaged',
-                'hp_empty': 'HP Empty',
-            }
-            status = "enabled" if is_enabled else "disabled"
-            self._append_log(f"Debug capture for {name_map[detection_type]}: {status}")
-
-    def _handle_capture_state(self):
-        """Capture current detection state for debugging"""
-        if not self._bot_is_running():
-            self._append_log("❌ Cannot capture state: Bot is not running.")
-            return
-
-        # Trigger manual capture by incrementing the counter
-        with self.manual_capture_trigger.get_lock():
-            self.manual_capture_trigger.value += 1
-
-        self._append_log(f"📸 Manual capture triggered! Bot will save screenshots of all detection zones on next loop iteration.")
-        self._append_log(f"   Check Data/Debug/ folder for files with 'MANUAL' in the name.")
-
-    def _handle_open_debug_folder(self):
-        """Open the debug screenshot folder in Windows Explorer"""
-        import os
-        import subprocess
-
-        debug_folder = bot_logic.get_data_path('Data\\Debug')
-
-        # Create folder if it doesn't exist
-        folder_existed = os.path.exists(debug_folder)
-        success, error = bot_logic.ensure_directory_exists(debug_folder)
-        if not success:
-            self._append_log(f"Error creating debug folder: {error}")
-            return
-        if not folder_existed:
-            self._append_log(f"Created debug folder: {debug_folder}")
-
-        # Open folder in Explorer
-        try:
-            subprocess.Popen(f'explorer "{debug_folder}"')
-            self._append_log("Opened debug screenshot folder.")
-        except Exception as e:
-            self._append_log(f"Error opening debug folder: {e}")
-
-    def _handle_show_overlay_toggled(self, checked):
-        """Handle detection overlay window toggle"""
-        if not self._bot_is_running():
-            self._append_log("❌ Cannot show overlay: Bot is not running.")
-            self.show_overlay_button.setChecked(False)
-            return
-
-        if checked:
-            # Enable overlay data sending in bot
-            with self.overlay_enabled.get_lock():
-                self.overlay_enabled.value = True
-
-            # Create and show overlay window
-            self._append_log("📍 TIP: Drag zones to adjust positions. Press 'P' to save debug file.")
-            if self.overlay_window is None:
-                self.overlay_window = DetectionOverlayWindow(log_callback=self._append_log)
-                # Set resolution info if available
-                self.overlay_window.set_resolution_info(
-                    self.current_resolution,
-                    self.current_scale_x,
-                    self.current_scale_y,
-                    self.current_border_offset
-                )
-            self.overlay_window.show()
-            self._append_log("✅ Detection overlay opened. Drag zones, press 'P' to save positions.")
-        else:
-            # Disable overlay data sending
-            with self.overlay_enabled.get_lock():
-                self.overlay_enabled.value = False
-
-            # Hide overlay window
-            if self.overlay_window:
-                self.overlay_window.hide()
-            self._append_log("Overlay window closed.")
-
     def _handle_screenshot_toggled(self, state):
         """Handle screenshot checkbox toggle"""
         is_enabled = (state == QtCore.Qt.Checked)
@@ -1636,7 +1968,7 @@ class BotWindow(QtWidgets.QMainWindow):
         import subprocess
 
         # Base screenshot folder
-        base_folder = bot_logic.get_data_path('Data\\All Loot Screenshots')
+        base_folder = bot_logic.get_data_path(bot_logic.SCREENSHOT_BASE_PATH)
 
         # Try to find the latest session folder
         folder_to_open = base_folder
@@ -1671,6 +2003,155 @@ class BotWindow(QtWidgets.QMainWindow):
             self._append_log("Opened screenshot folder.")
         except Exception as e:
             self._append_log(f"Error opening folder: {e}")
+
+    def _handle_resolution_mode_changed(self, index):
+        mode = self.resolution_mode_combo.itemData(index)
+        if mode is None:
+            return
+        with self.resolution_mode.get_lock():
+            self.resolution_mode.value = int(mode)
+        self._append_log(f"Resolution mode set to {self.resolution_mode_combo.currentText()}.")
+
+    def _handle_threshold_open_loot_changed(self, value):
+        with self.threshold_open_loot.get_lock():
+            self.threshold_open_loot.value = float(value)
+        if self.threshold_open_loot_spin.hasFocus():
+            self._append_log(f"Open loot threshold set to {value:.2f}.")
+
+    def _handle_threshold_loot_window_changed(self, value):
+        with self.threshold_loot_window.get_lock():
+            self.threshold_loot_window.value = float(value)
+        if self.threshold_loot_window_spin.hasFocus():
+            self._append_log(f"Loot window threshold set to {value:.2f}.")
+
+    def _handle_threshold_hp_full_changed(self, value):
+        with self.threshold_hp_full.get_lock():
+            self.threshold_hp_full.value = float(value)
+        if self.threshold_hp_full_spin.hasFocus():
+            self._append_log(f"Enemy HP full threshold set to {value:.2f}.")
+
+    def _handle_threshold_hp_damaged_changed(self, value):
+        with self.threshold_hp_damaged.get_lock():
+            self.threshold_hp_damaged.value = float(value)
+        if self.threshold_hp_damaged_spin.hasFocus():
+            self._append_log(f"Enemy HP damaged threshold set to {value:.2f}.")
+
+    def _handle_threshold_hp_empty_changed(self, value):
+        with self.threshold_hp_empty.get_lock():
+            self.threshold_hp_empty.value = float(value)
+        if self.threshold_hp_empty_spin.hasFocus():
+            self._append_log(f"Enemy HP empty threshold set to {value:.2f}.")
+
+    def _handle_reset_thresholds(self):
+        defaults = {
+            "open": bot_logic.THRESHOLD_OPEN_LOOT,
+            "loot": bot_logic.THRESHOLD_LOOT_WINDOW,
+            "hp_full": bot_logic.THRESHOLD_HP_FULL,
+            "hp_damaged": bot_logic.THRESHOLD_HP_DAMAGED,
+            "hp_empty": bot_logic.THRESHOLD_HP_EMPTY,
+        }
+        with self.threshold_open_loot.get_lock():
+            self.threshold_open_loot.value = defaults["open"]
+        with self.threshold_loot_window.get_lock():
+            self.threshold_loot_window.value = defaults["loot"]
+        with self.threshold_hp_full.get_lock():
+            self.threshold_hp_full.value = defaults["hp_full"]
+        with self.threshold_hp_damaged.get_lock():
+            self.threshold_hp_damaged.value = defaults["hp_damaged"]
+        with self.threshold_hp_empty.get_lock():
+            self.threshold_hp_empty.value = defaults["hp_empty"]
+
+        self._syncing_controls = True
+        self.threshold_open_loot_spin.setValue(defaults["open"])
+        self.threshold_loot_window_spin.setValue(defaults["loot"])
+        self.threshold_hp_full_spin.setValue(defaults["hp_full"])
+        self.threshold_hp_damaged_spin.setValue(defaults["hp_damaged"])
+        self.threshold_hp_empty_spin.setValue(defaults["hp_empty"])
+        self._syncing_controls = False
+        self._append_log("Thresholds reset to defaults.")
+
+    def _handle_debug_mode_toggled(self, state):
+        enabled = state == QtCore.Qt.Checked
+        with self.debug_mode.get_lock():
+            self.debug_mode.value = enabled
+        self.manual_capture_button.setEnabled(enabled)
+        self._append_log("Debug mode enabled." if enabled else "Debug mode disabled.")
+
+    def _handle_show_coords_toggled(self, state):
+        enabled = state == QtCore.Qt.Checked
+        with self.show_coords.get_lock():
+            self.show_coords.value = enabled
+        if self.show_coords_checkbox.hasFocus():
+            self._append_log("Click coordinate logging enabled." if enabled else "Click coordinate logging disabled.")
+
+    def _handle_show_confidence_toggled(self, state):
+        enabled = state == QtCore.Qt.Checked
+        with self.show_confidence.get_lock():
+            self.show_confidence.value = enabled
+        if self.show_confidence_checkbox.hasFocus():
+            self._append_log("Confidence logging enabled." if enabled else "Confidence logging disabled.")
+
+    def _handle_debug_capture_toggled(self, flag, state):
+        enabled = state == QtCore.Qt.Checked
+        with flag.get_lock():
+            flag.value = enabled
+
+    def _handle_disable_bot_actions_toggled(self, state):
+        """Handle disable bot actions checkbox toggle"""
+        is_disabled = (state == QtCore.Qt.Checked)
+        with self.disable_bot_actions.get_lock():
+            self.disable_bot_actions.value = is_disabled
+        status = "disabled" if is_disabled else "enabled"
+        self._append_log(f"Bot actions {status} (detection: {'only' if is_disabled else 'with actions'}).")
+
+    def _handle_use_overlay_zones_toggled(self, state):
+        self.use_overlay_zones = (state == QtCore.Qt.Checked)
+        status = "enabled" if self.use_overlay_zones else "disabled"
+        self._append_log(f"Overlay zone override {status}.")
+        try:
+            with self.use_overlay_zones_flag.get_lock():
+                self.use_overlay_zones_flag.value = 1 if self.use_overlay_zones else 0
+        except Exception:
+            pass
+
+        if self.use_overlay_zones:
+            regions = self._collect_overlay_regions()
+            if regions:
+                self._update_shared_overlay_zones(regions, force=True)
+            if not self.overlay_window:
+                self._append_log("Enable the overlay to adjust detection zones before starting the bot.")
+
+    def _handle_manual_capture(self):
+        with self.manual_capture_trigger.get_lock():
+            self.manual_capture_trigger.value += 1
+        self._append_log("Manual debug capture requested.")
+
+    def _handle_overlay_toggled(self, state):
+        enabled = state == QtCore.Qt.Checked
+        with self.overlay_enabled.get_lock():
+            self.overlay_enabled.value = enabled
+        if enabled:
+            self._ensure_overlay_window()
+            self.overlay_window.set_resolution_info(
+                self.current_resolution,
+                self.current_scale_x,
+                self.current_scale_y,
+                self.current_border_offset,
+            )
+            self.overlay_window.show()
+            self._append_log("Overlay display enabled.")
+        else:
+            if self.overlay_window:
+                self.overlay_window.hide()
+            self._append_log("Overlay display disabled.")
+
+    def _ensure_overlay_window(self):
+        if self.overlay_window is None:
+            self.overlay_window = DetectionOverlayWindow(
+                self,
+                log_callback=self._append_log,
+                update_callback=self._handle_overlay_zones_updated,
+            )
 
     def _poll_status(self):
         current_started = bool(self.started_flag.value)
@@ -1708,6 +2189,21 @@ class BotWindow(QtWidgets.QMainWindow):
         self._update_status_labels()
         self._last_started_state = current_started
 
+    def _format_elapsed_time(self, total_seconds):
+        """
+        Format elapsed time in seconds to HH:MM:SS string.
+
+        Args:
+            total_seconds: Time in seconds (float or int)
+
+        Returns:
+            Formatted time string (e.g., "01:23:45")
+        """
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = int(total_seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
     def _update_status_labels(self, initial=False):
         running = bool(self.started_flag.value)
         self.status_value_label.setText("Running" if running else "Stopped")
@@ -1726,10 +2222,7 @@ class BotWindow(QtWidgets.QMainWindow):
             current_elapsed = (datetime.now() - self._bot_start_time).total_seconds()
             total_seconds += current_elapsed
 
-        hours = int(total_seconds // 3600)
-        minutes = int((total_seconds % 3600) // 60)
-        seconds = int(total_seconds % 60)
-        self.running_time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        self.running_time_label.setText(self._format_elapsed_time(total_seconds))
 
     def _refresh_status_style(self):
         self.status_value_label.style().unpolish(self.status_value_label)
@@ -1748,85 +2241,38 @@ class BotWindow(QtWidgets.QMainWindow):
                 self._handle_status_event(event, log_messages)
 
     def _handle_status_event(self, event, log_messages):
-        if not log_messages:
-            return
-
         if isinstance(event, dict):
             event_type = event.get("type", "status")
-            message = event.get("message") or event_type.replace("_", " ").title()
 
-            # Update debug info labels
-            if event_type == "resolution_detected":
-                resolution = event.get("resolution")
-                scale_x = event.get("scale_x")
-                scale_y = event.get("scale_y")
-                border_offset = event.get("border_offset", (0, 0))
+            if event_type == "detection_overlay":
+                self._handle_overlay_frame(event)
+                return
 
-                # Store for overlay window
-                self.current_resolution = resolution
-                self.current_scale_x = scale_x if scale_x is not None else 1.0
-                self.current_scale_y = scale_y if scale_y is not None else 1.0
-                self.current_border_offset = border_offset
-
-                # Update overlay window if it exists
-                if self.overlay_window:
-                    self.overlay_window.set_resolution_info(
-                        resolution or "Unknown",
-                        self.current_scale_x,
-                        self.current_scale_y,
-                        border_offset
-                    )
-
-                if resolution:
-                    self.debug_resolution_label.setText(resolution)
-                if scale_x is not None and scale_y is not None:
-                    self.debug_scale_label.setText(f"{scale_x:.2f}x, {scale_y:.2f}x")
-
-            if event_type == "detection":
-                template_name = event.get("template")
-                confidence = event.get("confidence")
-                if template_name:
-                    display_text = template_name
-                    if confidence is not None and bool(self.show_confidence.value):
-                        display_text += f" ({confidence:.2f})"
-                    self.debug_last_detection_label.setText(display_text)
-
-            if event_type == "click":
-                x = event.get("x")
-                y = event.get("y")
-                if x is not None and y is not None:
-                    self.debug_last_click_label.setText(f"({x}, {y})")
-
-            # Handle overlay click visualization
             if event_type == "overlay_click":
-                if self.overlay_window:
+                if self.overlay_checkbox.isChecked():
+                    self._ensure_overlay_window()
+                    self.overlay_window.add_click(
+                        event.get("x"),
+                        event.get("y"),
+                        event.get("label", "Click"),
+                        event.get("color", (255, 255, 0)),
+                    )
+                if log_messages:
+                    label = event.get("label", "Click")
                     x = event.get("x")
                     y = event.get("y")
-                    label = event.get("label", "Click")
-                    color = event.get("color", (255, 255, 0))  # Default yellow
-                    if x is not None and y is not None:
-                        self.overlay_window.add_click(x, y, label, color)
+                    self._append_log(f"[OVERLAY] {label} at ({x}, {y})")
+                return
 
-            # Handle overlay click clearing
-            if event_type == "overlay_clear_clicks":
-                if self.overlay_window:
-                    self.overlay_window.clear_clicks()
+            if event_type == "overlay_error":
+                if log_messages:
+                    self._append_log(f"[OVERLAY] {event.get('message', 'Overlay error')}")
+                return
 
-            # Handle detection overlay updates
-            if event_type == "detection_overlay":
-                if self.overlay_window and self.show_overlay_button.isChecked():
-                    import numpy as np
-                    # Decode the image data
-                    image_bytes = event.get("image")
-                    zones = event.get("zones", {})
-                    if image_bytes:
-                        # Convert bytes back to numpy array
-                        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
-                        width = event.get("width", 0)
-                        height = event.get("height", 0)
-                        if width and height:
-                            image_array = image_array.reshape((height, width, 3))
-                            self.overlay_window.update_detection_data(image_array, zones)
+            if not log_messages:
+                return
+
+            message = event.get("message") or event_type.replace("_", " ").title()
 
             loot_count = event.get("loot_count")
             legendary_count = event.get("legendary_count")
@@ -1853,32 +2299,123 @@ class BotWindow(QtWidgets.QMainWindow):
 
             extras = " | ".join(log_parts[1:]) if len(log_parts) > 1 else ""
 
-            # Skip logging for certain debug events based on flags
-            should_log = True
-            if event_type == "detection":
-                # Only log detection events if show_confidence is enabled
-                should_log = bool(self.show_confidence.value)
-            elif event_type == "click":
-                # Only log click events if show_coords is enabled
-                should_log = bool(self.show_coords.value)
+            if event_type == "error":
+                log_entry = f"[ERROR] {message}"
+            elif event_type == "legendary":
+                log_entry = f"[LEGENDARY] {message}"
+                if extras:
+                    log_entry += f" | {extras}"
+            else:
+                log_entry = " | ".join(filter(None, [message, extras]))
 
-            if should_log:
-                if event_type == "error":
-                    log_entry = f"[ERROR] {message}"
-                    level = "error"
-                elif event_type == "legendary":
-                    log_entry = f"[LEGENDARY] {message}"
-                    if extras:
-                        log_entry += f" | {extras}"
-                    level = "legendary"
-                else:
-                    log_entry = " | ".join(filter(None, [message, extras]))
-                    level = "info"
-
-                self._append_log(log_entry)
+            self._append_log(log_entry)
         else:
-            text = str(event)
-            self._append_log(text)
+            if log_messages:
+                text = str(event)
+                self._append_log(text)
+
+    def _handle_overlay_frame(self, event):
+        if not self.overlay_checkbox.isChecked():
+            return
+
+        image_data = event.get("image")
+        width = event.get("width")
+        height = event.get("height")
+        zones = event.get("zones")
+        resolution = event.get("resolution", "Unknown")
+        scale_x = event.get("scale_x", 1.0)
+        scale_y = event.get("scale_y", 1.0)
+        border_offset = event.get("border_offset", (0, 0))
+
+        if image_data is None or not width or not height:
+            return
+
+        if isinstance(image_data, list):
+            image_data = bytes(image_data)
+        elif isinstance(image_data, str):
+            image_data = image_data.encode("latin1")
+
+        self._ensure_overlay_window()
+        self.overlay_window.set_resolution_info(
+            resolution,
+            scale_x,
+            scale_y,
+            border_offset,
+        )
+        self.overlay_window.update_detection_data(image_data, width, height, zones)
+        regions = self.overlay_window.get_adjusted_regions()
+        if regions:
+            self._update_shared_overlay_zones(regions, force=False)
+
+    @staticmethod
+    def _normalize_overlay_regions(regions):
+        if not regions:
+            return None
+        normalized = {}
+        for name, data in regions.items():
+            if not isinstance(data, dict):
+                continue
+            try:
+                normalized[name] = {
+                    "x": int(data.get("x", 0)),
+                    "y": int(data.get("y", 0)),
+                    "w": max(1, int(data.get("w", 0))),
+                    "h": max(1, int(data.get("h", 0))),
+                }
+            except Exception:
+                continue
+        return normalized or None
+
+    def _update_shared_overlay_zones(self, regions, force=False):
+        normalized = self._normalize_overlay_regions(regions)
+        if not force and normalized == self.overlay_last_regions:
+            return self.overlay_last_regions
+
+        self.overlay_last_regions = normalized
+
+        if self.overlay_zones_dict is None:
+            return normalized
+
+        try:
+            self.overlay_zones_dict.clear()
+            if normalized:
+                for name, data in normalized.items():
+                    self.overlay_zones_dict[name] = data
+        except Exception as exc:
+            self._append_log(f"Failed to sync overlay zones: {exc}")
+
+        return normalized
+
+    def _handle_overlay_zones_updated(self, regions):
+        self._update_shared_overlay_zones(regions, force=True)
+
+    def _collect_overlay_regions(self):
+        if self.overlay_window:
+            current = self.overlay_window.get_adjusted_regions()
+            if current:
+                normalized = self._normalize_overlay_regions(current)
+                if normalized:
+                    self.overlay_last_regions = normalized
+        if self.overlay_last_regions:
+            return {name: dict(values) for name, values in self.overlay_last_regions.items()}
+        return None
+
+    def _apply_validation_details(self, details):
+        if not isinstance(details, dict):
+            return
+        self.current_resolution = details.get("detected_resolution", "Unknown")
+        self.current_scale_x = float(details.get("scale_x", 1.0))
+        self.current_scale_y = float(details.get("scale_y", 1.0))
+        border = details.get("border_offset")
+        if isinstance(border, (tuple, list)) and len(border) == 2:
+            self.current_border_offset = (int(border[0]), int(border[1]))
+        if self.overlay_window:
+            self.overlay_window.set_resolution_info(
+                self.current_resolution,
+                self.current_scale_x,
+                self.current_scale_y,
+                self.current_border_offset,
+            )
 
     def _append_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1909,17 +2446,15 @@ class BotWindow(QtWidgets.QMainWindow):
                 self.process.join(timeout=1.0)
             self.process = None
 
+        if self.overlay_window:
+            self.overlay_window.hide()
+
         with self.started_flag.get_lock():
             self.started_flag.value = False
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
         speak_async("Bot Stopped")
         note = "Bot stopped." if manual else "Bot process ended."
         self._append_log(note)
-
-        # Reset overlay zones to default positions
-        if self.overlay_window:
-            self.overlay_window.reset_offsets()
-
         self._drain_status_queue()
         self._update_status_labels()
 
@@ -2008,6 +2543,7 @@ class BotWindow(QtWidgets.QMainWindow):
 
 
 def _build_shared_state():
+    manager = _get_shared_manager()
     return {
         "started": multiprocessing.Value("i", False),
         "gui_settings_opened": multiprocessing.Value("i", False),
@@ -2016,33 +2552,51 @@ def _build_shared_state():
         "loot_opened": multiprocessing.Value("i", 0),
         "legendaries": multiprocessing.Value("i", 0),
         "screenshot_enabled": multiprocessing.Value("i", True),  # Default: enabled
-        # Template matching thresholds (0.0 to 1.0)
-        "threshold_open_loot": multiprocessing.Value("d", 0.40),
-        "threshold_loot_window": multiprocessing.Value("d", 0.35),
-        "threshold_hp_full": multiprocessing.Value("d", 0.85),
-        "threshold_hp_damaged": multiprocessing.Value("d", 0.95),
-        "threshold_hp_empty": multiprocessing.Value("d", 0.90),
-        # Debug options
-        "debug_mode": multiprocessing.Value("i", False),  # Save detection screenshots
-        "show_coords": multiprocessing.Value("i", False),  # Log click coordinates
-        "show_confidence": multiprocessing.Value("i", False),  # Log confidence scores
-        # Debug capture selection (which detections to save)
+        "resolution_mode": multiprocessing.Value("i", bot_logic.DEFAULT_RESOLUTION_MODE),
+        "threshold_open_loot": multiprocessing.Value("d", bot_logic.THRESHOLD_OPEN_LOOT),
+        "threshold_loot_window": multiprocessing.Value("d", bot_logic.THRESHOLD_LOOT_WINDOW),
+        "threshold_hp_full": multiprocessing.Value("d", bot_logic.THRESHOLD_HP_FULL),
+        "threshold_hp_damaged": multiprocessing.Value("d", bot_logic.THRESHOLD_HP_DAMAGED),
+        "threshold_hp_empty": multiprocessing.Value("d", bot_logic.THRESHOLD_HP_EMPTY),
+        "debug_mode": multiprocessing.Value("i", False),
+        "show_coords": multiprocessing.Value("i", False),
+        "show_confidence": multiprocessing.Value("i", False),
         "debug_capture_open_loot": multiprocessing.Value("i", True),
         "debug_capture_loot_window": multiprocessing.Value("i", True),
         "debug_capture_hp_full": multiprocessing.Value("i", False),
         "debug_capture_hp_damaged": multiprocessing.Value("i", False),
         "debug_capture_hp_empty": multiprocessing.Value("i", False),
-        # Manual capture trigger (button press)
-        "manual_capture_trigger": multiprocessing.Value("i", 0),  # Increments each button press
-        # Detection overlay
-        "overlay_enabled": multiprocessing.Value("i", False),  # Whether to send overlay data
+        "manual_capture_trigger": multiprocessing.Value("i", 0),
+        "overlay_enabled": multiprocessing.Value("i", False),
+        "disable_bot_actions": multiprocessing.Value("i", False),
+        "use_overlay_zones_flag": multiprocessing.Value("i", False),
+        "overlay_zones_dict": manager.dict(),
     }
 
 
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
+def main():
+    """Main entry point - only runs in the main process"""
     shared_state = _build_shared_state()
     app = QtWidgets.QApplication(sys.argv)
     window = BotWindow(shared_state)
     window.show()
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    # Required for PyInstaller to work with multiprocessing on Windows
+    # freeze_support() must be called FIRST before any other code
+    multiprocessing.freeze_support()
+
+    # CRITICAL: Only run GUI in main process, not in spawned subprocesses
+    # This prevents the frozen exe from opening multiple windows
+    if multiprocessing.current_process().name == 'MainProcess':
+        # Set spawn method explicitly for Windows + PyInstaller compatibility
+        if sys.platform == 'win32':
+            try:
+                multiprocessing.set_start_method('spawn')
+            except RuntimeError:
+                # Already set, ignore
+                pass
+
+        main()

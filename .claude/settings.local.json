@@ -1,7 +1,22 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "WebSearch",
+      "WebFetch(domain:stackoverflow.com)",
+      "WebFetch(domain:superuser.com)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "Bash(del test_path_join.py)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(git log:*)",
+      "Bash(git checkout:*)",
+      "Bash(git stash push:*)"
     ],
     "deny": [],
     "ask": []
