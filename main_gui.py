@@ -300,6 +300,9 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
         # Persistent zone storage (for restoring custom zones across updates)
         self.overlay_last_regions = None
 
+        # Pending offset clear tracking (zones waiting for bot confirmation)
+        self._pending_clear_zones = set()
+
         # Initialize mode label
         self._update_mode_label()
 
@@ -342,10 +345,27 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
                     "h": max(self.MIN_ZONE_HEIGHT, min_h),
                 }
 
-                # Skip updating offsets/sizes for zones currently being manipulated
-                # This prevents incoming data from interfering with user drag/resize operations
-                if name == self.dragging_zone or name == self.resizing_zone:
-                    # Keep existing offsets and sizes, don't reset them
+                # COMPLETELY freeze zones during interaction - preserve old base data
+                # This prevents bot's 30 FPS updates from replacing base coordinates during drag
+                # Also freeze zones waiting for bot confirmation (pending clear)
+                if name == self.dragging_zone or name == self.resizing_zone or name in self._pending_clear_zones:
+                    # Preserve old base zone data instead of accepting new data from bot
+                    if name in self.detection_zones:
+                        # Freeze position/size and force not detected during manipulation
+                        # Bot detects at base position, not at visual offset position
+                        old_zone = self.detection_zones[name]
+                        new_zones[name].update({
+                            "x": old_zone["x"],
+                            "y": old_zone["y"],
+                            "w": old_zone["w"],
+                            "h": old_zone["h"],
+                            "detected": False,  # Force red - we don't know what's at new position yet
+                        })
+                        min_sizes[name] = self.zone_min_sizes.get(name, min_sizes[name])
+                    else:
+                        # First time seeing this zone, accept it
+                        pass  # new_zones[name] already set above
+                    # Ensure offsets exist but don't modify them
                     self.zone_offsets.setdefault(name, {"dx": 0, "dy": 0})
                     self.zone_size_changes.setdefault(name, {"dw": 0, "dh": 0})
                     continue
@@ -374,6 +394,32 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
 
             self.detection_zones = new_zones
             self.zone_min_sizes = min_sizes
+
+            # Clear offsets for zones that finished dragging and bot has confirmed update
+            # Bot confirmation detected by comparing new base position against overlay_last_regions
+            for zone_name in list(self._pending_clear_zones):
+                # Don't clear offsets for zones currently being interacted with
+                if zone_name == self.dragging_zone or zone_name == self.resizing_zone:
+                    continue
+
+                if zone_name in new_zones and self.overlay_last_regions:
+                    # Check if bot confirmed update by comparing base position
+                    # Bot's new base should match the adjusted position we sent (overlay_last_regions)
+                    expected = self.overlay_last_regions.get(zone_name)
+                    if expected:
+                        bot_base = new_zones[zone_name]
+                        # Allow 2px tolerance for rounding
+                        dx_diff = abs(bot_base["x"] - expected["x"])
+                        dy_diff = abs(bot_base["y"] - expected["y"])
+                        dw_diff = abs(bot_base["w"] - expected["w"])
+                        dh_diff = abs(bot_base["h"] - expected["h"])
+
+                        if dx_diff <= 2 and dy_diff <= 2 and dw_diff <= 2 and dh_diff <= 2:
+                            # Bot confirmed! Base now matches our adjusted position
+                            # Safe to clear offset since base absorbed it
+                            self.zone_offsets[zone_name] = {"dx": 0, "dy": 0}
+                            self.zone_size_changes[zone_name] = {"dw": 0, "dh": 0}
+                            self._pending_clear_zones.discard(zone_name)
 
             # Remove stale offsets for zones no longer present
             # BUT: Don't remove offsets for zones currently being dragged/resized
@@ -429,6 +475,7 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
     def reset_offsets(self):
         self.zone_offsets = {name: {"dx": 0, "dy": 0} for name in self.detection_zones}
         self.zone_size_changes = {name: {"dw": 0, "dh": 0} for name in self.detection_zones}
+        self._pending_clear_zones.clear()  # Unfreeze all zones after reset
         if self.log_callback:
             self.log_callback("Overlay zones reset to default positions and sizes.")
         self._render_overlay()
@@ -775,9 +822,9 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
                         f"{self.dragging_zone} moved: offset dx={offset['dx']}, dy={offset['dy']}"
                     )
                 self._emit_zone_update()
-                # Clear offsets - they're now baked into the base position sent to bot
-                # This prevents feedback loop where old offsets get applied to new base
-                self.zone_offsets[self.dragging_zone] = {"dx": 0, "dy": 0}
+                # Mark zone for pending clear - wait for bot to confirm update
+                # This prevents reset on fast drags due to async update delay
+                self._pending_clear_zones.add(self.dragging_zone)
                 self.dragging_zone = None
                 self.drag_start_pos = None
                 self.drag_start_zone_pos = None
@@ -797,11 +844,9 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
                         f"(dw={size_change['dw']}, dh={size_change['dh']})"
                     )
                 self._emit_zone_update()
-                # Clear size changes - they're now baked into the base size sent to bot
-                # This prevents feedback loop where old size changes get applied to new base
-                self.zone_size_changes[self.resizing_zone] = {"dw": 0, "dh": 0}
-                # Also clear offsets in case resize affected position (left/top edges)
-                self.zone_offsets[self.resizing_zone] = {"dx": 0, "dy": 0}
+                # Mark zone for pending clear - wait for bot to confirm update
+                # This prevents reset on fast resize due to async update delay
+                self._pending_clear_zones.add(self.resizing_zone)
                 self.resizing_zone = None
                 self.resize_start_pos = None
                 self.resize_start_size = None
@@ -831,6 +876,8 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
             self.resize_start_zone_data = None  # Clear snapshot
             self.resize_type = None
             self.setCursor(QtCore.Qt.ArrowCursor)
+            # Clear pending clear flags since operation was cancelled
+            self._pending_clear_zones.clear()
 
         super().leaveEvent(event)
 
@@ -896,6 +943,7 @@ class DetectionOverlayWindow(QtWidgets.QWidget):
         elif action == reset_zone_action and zone_under_cursor:
             self.zone_offsets[zone_under_cursor] = {"dx": 0, "dy": 0}
             self.zone_size_changes[zone_under_cursor] = {"dw": 0, "dh": 0}
+            self._pending_clear_zones.discard(zone_under_cursor)  # Unfreeze this zone
             if self.log_callback:
                 self.log_callback(f"Reset {zone_under_cursor} to defaults.")
             self._render_overlay()
